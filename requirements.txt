@@ -13,7 +13,6 @@ python-dotenv>=1.0
 # these are Python-side helpers/bindings used alongside it.
 ffmpeg-python>=0.2.0
 pydub>=0.25.1
-torchaudio>=2.2
 
 # --- Transcription / alignment / diarization ---
 # Installed from GitHub rather than PyPI: WhisperX's PyPI releases lag
@@ -21,7 +20,6 @@ torchaudio>=2.2
 # support and diarization pipeline fixes. Pin to a specific commit once
 # this stabilizes for your setup, to avoid surprise breakage on reinstall.
 whisperx @ git+https://github.com/m-bain/whisperX.git
-torch>=2.2
 # pyannote.audio is pulled in automatically as a WhisperX dependency —
 # it is never imported directly outside backend/transcribe.py.
 
