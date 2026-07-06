@@ -67,7 +67,22 @@ class Settings(BaseSettings):
     @field_validator("language", "min_speakers", "max_speakers", mode="before")
     @classmethod
     def empty_str_to_none(cls, v: Any) -> Any:
-        return None if v == "" else v
+        if v == "":
+            return None
+        # Fix for Google Colab: Colab sets a global OS env var `LANGUAGE=en_US`.
+        # Since pydantic reads OS env vars, this injects "en_US" into WhisperX,
+        # crashing it. We strictly normalize any language string to its 2-letter ISO code.
+        if isinstance(v, str) and cls == Settings:
+            pass # wait, cls == Settings is always true, but let's just do it securely below
+        
+        return v
+
+    @field_validator("language", mode="after")
+    @classmethod
+    def normalize_language(cls, v: Any) -> Any:
+        if isinstance(v, str) and len(v) > 2:
+            return v[:2].lower()
+        return v
 
     # --- Ollama ---
     ollama_host: str = "http://localhost:11434"
