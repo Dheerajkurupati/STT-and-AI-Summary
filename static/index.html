@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meeting AI</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <h1>Meeting AI</h1>
+            <p>Upload a recording to get a beautiful, speaker-separated transcript and AI summary.</p>
+        </header>
+
+        <main>
+            <section class="upload-section">
+                <form id="uploadForm">
+                    <label for="audioFile" class="file-upload-label">
+                        <div class="upload-icon">📁</div>
+                        <span id="file-name">Click to browse or drag a file here</span>
+                        <input type="file" id="audioFile" name="file" accept="audio/*,video/*" required>
+                    </label>
+                    <button type="submit" id="transcribeBtn" class="primary-btn" disabled>Generate Transcript</button>
+                </form>
+                <div id="loading" class="hidden">
+                    <div class="spinner"></div>
+                    <p>Processing audio (this may take a minute)...</p>
+                </div>
+            </section>
+
+            <section id="resultsSection" class="results-section hidden">
+                <div class="transcript-header">
+                    <h2>Transcript</h2>
+                    <span id="metaInfo" class="badge"></span>
+                </div>
+                
+                <div id="transcriptContainer" class="transcript-container">
+                    <!-- Transcript blocks will be injected here -->
+                </div>
+
+                <div class="summary-action">
+                    <button id="summaryBtn" class="primary-btn ai-btn">✨ Generate AI Summary</button>
+                    <div id="summaryLoading" class="hidden">
+                        <div class="spinner small"></div>
+                        <span>Ollama is thinking...</span>
+                    </div>
+                </div>
+
+                <div id="summaryContainer" class="summary-container hidden">
+                    <h2>AI Summary</h2>
+                    <div id="summaryContent" class="summary-content">
+                        <!-- Summary will be injected here -->
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

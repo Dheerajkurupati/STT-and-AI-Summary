@@ -1,0 +1,31 @@
+# --- Backend framework ---
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.9   # required by FastAPI to parse multipart/form-data file uploads
+
+# --- Configuration ---
+pydantic>=2.7
+pydantic-settings>=2.3    # typed .env loading, see backend/config.py
+python-dotenv>=1.0
+
+# --- Audio preprocessing ---
+# ffmpeg itself is a system binary (installed via Homebrew, not pip) —
+# these are Python-side helpers/bindings used alongside it.
+ffmpeg-python>=0.2.0
+pydub>=0.25.1
+torchaudio>=2.2
+
+# --- Transcription / alignment / diarization ---
+# Installed from GitHub rather than PyPI: WhisperX's PyPI releases lag
+# behind its GitHub main branch, which has the current Whisper large-v3
+# support and diarization pipeline fixes. Pin to a specific commit once
+# this stabilizes for your setup, to avoid surprise breakage on reinstall.
+whisperx @ git+https://github.com/m-bain/whisperX.git
+torch>=2.2
+# pyannote.audio is pulled in automatically as a WhisperX dependency —
+# it is never imported directly outside backend/transcribe.py.
+
+# --- LLM (Ollama) ---
+ollama>=0.3.0
+
+# --- Logging is stdlib `logging`; no extra dependency needed ---

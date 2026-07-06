@@ -1,0 +1,23 @@
+# Secrets — never commit real config
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Runtime data — these directories are structural (kept via .gitkeep),
+# but their contents are user uploads / generated outputs / scratch files,
+# not source code.
+uploads/*
+!uploads/.gitkeep
+temp/*
+!temp/.gitkeep
+outputs/*
+!outputs/.gitkeep
+logs/*
+!logs/.gitkeep
