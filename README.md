@@ -7,7 +7,7 @@ Pipeline: FFmpeg preprocessing -> WhisperX (Whisper large-v3 + alignment +
 pyannote diarization) -> transcript formatting -> Ollama (llama3.1:8b /
 qwen3:8b) summarization.
 
-## Setup (macOS)
+## Setup (macOS Local Testing)
 
 1. **Homebrew** — if not already installed:
    `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
@@ -84,6 +84,31 @@ qwen3:8b) summarization.
     curl -X POST http://localhost:8000/transcribe \
       -F "file=@uploads/your_test_file.mp3"
     ```
+
+## Setup (Cloud GPU / Google Colab / Linux)
+
+To run **Whisper `large-v3`** at full speed, an NVIDIA GPU with at least 16GB VRAM is highly recommended. 
+
+1. **Clone the repository:**
+   `git clone https://github.com/Dheerajkurupati/STT-and-AI-Summary.git`
+2. **Install Requirements:**
+   If running on a Linux GPU server, ensure PyTorch is compiled for your CUDA version before installing `requirements.txt`:
+   ```bash
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+   pip install -r requirements.txt
+   ```
+3. **Configure the Environment:**
+   Copy `.env.example` to `.env` and set:
+   - `HF_TOKEN=<your token>`
+   - `WHISPER_MODEL=large-v3`
+   - `DEVICE=cuda`
+   - `COMPUTE_TYPE=float16`
+4. **Install Ollama (Linux):**
+   `curl -fsSL https://ollama.com/install.sh | sh`
+   `ollama serve &`
+   `ollama pull llama3.1:8b`
+5. **Start the Web Interface:**
+   `uvicorn backend.app:app --host 0.0.0.0 --port 8000`
 
 ## Project structure
 
