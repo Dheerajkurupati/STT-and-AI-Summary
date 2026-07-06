@@ -132,7 +132,11 @@ class WhisperXPipeline:
                 language=settings.language,
             )
             detected_language = transcription["language"]
-            logger.info("Detected language: %s", detected_language)
+            # Whisper large-v3 sometimes returns variants like 'en_US'
+            # but the alignment model expects strict 2-letter ISO codes.
+            if len(detected_language) > 2:
+                detected_language = detected_language[:2].lower()
+            logger.info("Detected language (normalized): %s", detected_language)
 
             align_model, align_metadata = self._load_align_model(detected_language)
             aligned = whisperx.align(
