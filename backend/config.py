@@ -85,7 +85,8 @@ class Settings(BaseSettings):
         return v
 
     # --- Ollama ---
-    ollama_host: str = "http://localhost:11434"
+    # Using 127.0.0.1 instead of localhost to prevent IPv6 httpx timeouts on Macs
+    ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "llama3.1:8b"
     ollama_request_timeout: int = 300
 
