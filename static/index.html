@@ -16,13 +16,26 @@
 
         <main>
             <section class="upload-section">
+                <!-- Live Recording Area -->
+                <div class="recording-container">
+                    <button id="startRecordBtn" class="primary-btn record-btn">🎙️ Start Recording Meeting</button>
+                    <div id="recordingState" class="recording-state hidden">
+                        <div class="recording-indicator"></div>
+                        <span id="recordingTimer">00:00</span>
+                        <button id="stopRecordBtn" class="secondary-btn stop-btn">🛑 Stop & Transcribe</button>
+                    </div>
+                </div>
+
+                <div class="divider"><span>OR</span></div>
+
+                <!-- File Upload Area -->
                 <form id="uploadForm">
                     <label for="audioFile" class="file-upload-label">
                         <div class="upload-icon">📁</div>
                         <span id="file-name">Click to browse or drag a file here</span>
                         <input type="file" id="audioFile" name="file" accept="audio/*,video/*" required>
                     </label>
-                    <button type="submit" id="transcribeBtn" class="primary-btn" disabled>Generate Transcript</button>
+                    <button type="submit" id="transcribeBtn" class="primary-btn" disabled>Generate Transcript from File</button>
                 </form>
                 <div id="loading" class="hidden">
                     <div class="spinner"></div>

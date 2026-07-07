@@ -14,9 +14,15 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
 
     const formData = new FormData();
     formData.append('file', file);
+    
+    await submitToBackend(formData);
+});
 
+async function submitToBackend(formData) {
     // Update UI state
     document.getElementById('uploadForm').classList.add('hidden');
+    document.querySelector('.recording-container').classList.add('hidden');
+    document.querySelector('.divider').classList.add('hidden');
     document.getElementById('loading').classList.remove('hidden');
     document.getElementById('resultsSection').classList.add('hidden');
     document.getElementById('summaryContainer').classList.add('hidden');
@@ -38,14 +44,105 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
         
         document.getElementById('loading').classList.add('hidden');
         document.getElementById('uploadForm').classList.remove('hidden');
+        document.querySelector('.recording-container').classList.remove('hidden');
+        document.querySelector('.divider').classList.remove('hidden');
         document.getElementById('resultsSection').classList.remove('hidden');
 
     } catch (error) {
         alert("Transcription failed: " + error.message);
         document.getElementById('loading').classList.add('hidden');
         document.getElementById('uploadForm').classList.remove('hidden');
+        document.querySelector('.recording-container').classList.remove('hidden');
+        document.querySelector('.divider').classList.remove('hidden');
+    }
+}
+
+// --- Live Recording Logic ---
+let mediaRecorder;
+let audioChunks = [];
+let recordingInterval;
+let recordingSeconds = 0;
+
+const startBtn = document.getElementById('startRecordBtn');
+const stopBtn = document.getElementById('stopRecordBtn');
+const recordingState = document.getElementById('recordingState');
+const timerDisplay = document.getElementById('recordingTimer');
+
+startBtn.addEventListener('click', async () => {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        
+        // Supported mime types vary by browser. webm is standard for Chrome/Firefox, mp4 for Safari
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
+        mediaRecorder = new MediaRecorder(stream, { mimeType });
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) audioChunks.push(event.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+            clearInterval(recordingInterval);
+            
+            // Stop all tracks to release the microphone hardware
+            stream.getTracks().forEach(track => track.stop());
+
+            // If stopped immediately, chunks might be empty or too small
+            if (audioChunks.length === 0 || recordingSeconds < 2) {
+                alert("Recording was too short. Please record for at least 2 seconds.");
+                resetRecordingUI();
+                return;
+            }
+
+            const audioBlob = new Blob(audioChunks, { type: mimeType });
+            
+            // Convert Blob to a File object so FastAPI's UploadFile accepts it seamlessly
+            const fileExtension = mimeType.includes('webm') ? 'webm' : 'mp4';
+            const audioFile = new File([audioBlob], `live_recording.${fileExtension}`, { type: mimeType });
+            
+            const formData = new FormData();
+            formData.append('file', audioFile);
+            
+            resetRecordingUI();
+            await submitToBackend(formData);
+        };
+
+        mediaRecorder.start(250); // fire ondataavailable every 250ms for safety
+        
+        // Update UI
+        startBtn.classList.add('hidden');
+        recordingState.classList.remove('hidden');
+        document.getElementById('uploadForm').classList.add('hidden'); // Hide upload while recording
+        
+        // Start Timer
+        recordingSeconds = 0;
+        timerDisplay.textContent = "00:00";
+        recordingInterval = setInterval(() => {
+            recordingSeconds++;
+            const mins = Math.floor(recordingSeconds / 60).toString().padStart(2, '0');
+            const secs = (recordingSeconds % 60).toString().padStart(2, '0');
+            timerDisplay.textContent = `${mins}:${secs}`;
+        }, 1000);
+
+    } catch (err) {
+        console.error("Microphone error:", err);
+        alert("Microphone access denied or unavailable. Please check your browser permissions.");
     }
 });
+
+stopBtn.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+    }
+});
+
+function resetRecordingUI() {
+    startBtn.classList.remove('hidden');
+    recordingState.classList.add('hidden');
+    document.getElementById('uploadForm').classList.remove('hidden');
+    timerDisplay.textContent = "00:00";
+}
+
 
 function displayTranscript(data) {
     const container = document.getElementById('transcriptContainer');
