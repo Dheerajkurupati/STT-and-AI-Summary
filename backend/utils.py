@@ -32,7 +32,7 @@ from backend.config import settings
 # Formats we explicitly support at the API boundary. Rejecting early with a
 # clear error is better than letting ffmpeg fail deep inside a subprocess
 # call with a cryptic exit code.
-SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4"}
+SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".webm", ".ogg", ".mkv"}
 
 # Whisper's expected input format. 16kHz mono is the sample rate the model
 # was trained on; anything else works but wastes compute / can degrade
