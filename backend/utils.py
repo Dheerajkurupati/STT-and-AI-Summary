@@ -128,10 +128,11 @@ def convert_to_wav(input_path: Path, temp_dir: Path | None = None) -> Path:
         "-ac", str(TARGET_CHANNELS),
         "-ar", str(TARGET_SAMPLE_RATE),
         "-vn",  # drop any video stream (relevant for .mp4 input)
+        "-af", "afftdn,loudnorm",  # Denoise and normalize volume to stabilize diarization
         str(output_path),
     ]
 
-    logger.info("Converting %s -> %s (16kHz mono WAV)", input_path.name, output_path.name)
+    logger.info("Converting %s -> %s (16kHz mono WAV, Denoised & Normalized)", input_path.name, output_path.name)
 
     try:
         subprocess.run(

@@ -19,11 +19,11 @@ throughout the session without requiring the full audio up front.
 WHY faster-whisper INSTEAD OF whisperx HERE:
 WhisperX is great for batch (it adds alignment + diarization on top of Whisper), but
 for live chunks we need raw speed. faster-whisper (CTranslate2 backend) is
-4x faster than original Whisper on CPU, which keeps per-chunk latency low on
-an M-series Mac running the "base" model.
+4x faster than original Whisper on CPU.
 
 KEY IMPROVEMENTS OVER V1:
-- Buffer increased from 3s -> 5s for more stable voice embeddings (fewer false "new speaker").
+- Buffer increased from 3s -> 5s for more context.
+- Pyannote Wespeaker replaces Resemblyzer for robust per-segment identification (handles interruptions properly).
 - repetition_penalty + no_repeat_ngram_size added to kill Whisper hallucinations.
 - language locked to "en" per chunk (was auto-detecting, causing Korean/Dutch hallucinations).
 - log_prob_threshold + compression_ratio_threshold filter out low-confidence garbage.
@@ -108,10 +108,12 @@ class LiveTranscriptionSession:
     def _load_encoder(self) -> None:
         if self._voice_encoder is not None:
             return
-        from resemblyzer import VoiceEncoder
+        import torch
+        from pyannote.audio import Model, Inference
 
-        logger.info("Loading resemblyzer VoiceEncoder (live speaker tracking)")
-        self._voice_encoder = VoiceEncoder()
+        logger.info("Loading Pyannote Wespeaker (live speaker tracking)")
+        model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM")
+        self._voice_encoder = Inference(model, window="whole", device=torch.device("cpu"))
 
     # ------------------------------------------------------------------ #
     #  Text post-processing                                                #
@@ -166,31 +168,38 @@ class LiveTranscriptionSession:
         Return a consistent "Speaker N" label for the audio window.
 
         Steps:
-          1. Compute 256-d voice embedding with resemblyzer.
-          2. Cosine-compare against stored profiles.
-          3. Above threshold -> known speaker, update running average.
-          4. Below threshold -> new speaker, register profile.
+          1. Compute 256-d voice embedding with Pyannote Wespeaker.
+          2. Cosine-distance compare against stored profiles.
+          3. Below threshold -> known speaker, update running average.
+          4. Above threshold -> new speaker, register profile.
         """
-        try:
-            from resemblyzer import preprocess_wav
+        import torch
 
-            # resemblyzer expects float32 at 16kHz, values in [-1, 1]
-            wav = preprocess_wav(audio, source_sr=SAMPLE_RATE)
-            embedding = self._voice_encoder.embed_utterance(wav)  # (256,) float32
-            embedding = embedding / (np.linalg.norm(embedding) + 1e-8)  # L2 normalize
+        try:
+            # Pyannote expects a dict with waveform tensor (channel, time) and sample rate
+            tensor = torch.from_numpy(audio).unsqueeze(0)
+            
+            # Extract embedding - returns a numpy array of shape (256,)
+            embedding = self._voice_encoder({"waveform": tensor, "sample_rate": SAMPLE_RATE})
+            
+            # Normalize embedding just in case to make cosine logic simple
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
 
             best_label: Optional[str] = None
-            best_sim = -1.0
+            best_dist = float('inf')
 
             for label, profile in self._speaker_profiles.items():
+                # Cosine distance = 1 - cosine similarity
                 sim = float(np.dot(embedding, profile))
-                if sim > best_sim:
-                    best_sim = sim
+                dist = 1.0 - sim
+                if dist < best_dist:
+                    best_dist = dist
                     best_label = label
 
-            if best_label and best_sim >= settings.live_similarity_threshold:
+            if best_label and best_dist <= settings.live_wespeaker_threshold:
                 # Known speaker - update running average so the profile adapts
-                # to natural variations in the speaker's voice over the session.
                 n = self._speaker_counts[best_label]
                 self._speaker_profiles[best_label] = (
                     (self._speaker_profiles[best_label] * n + embedding) / (n + 1)
@@ -203,12 +212,11 @@ class LiveTranscriptionSession:
             self._next_num += 1
             self._speaker_profiles[label] = embedding
             self._speaker_counts[label] = 1
-            logger.info("New speaker detected: %s (best_sim=%.3f)", label, best_sim)
+            logger.info("New speaker detected: %s (best_dist=%.3f)", label, best_dist)
             return label
 
         except Exception as exc:
-            # If resemblyzer fails (very short audio, silence, etc.), fall back
-            # gracefully rather than crashing the WebSocket handler.
+            # If embedding fails (very short audio, silence, etc.), fall back gracefully
             logger.warning("Speaker embedding failed: %s - labelling as Speaker 1", exc)
             return "Speaker 1"
 

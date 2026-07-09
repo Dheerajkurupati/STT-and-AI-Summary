@@ -72,10 +72,9 @@ class Settings(BaseSettings):
     # How many seconds of audio to buffer before each transcription pass.
     # Lower = more responsive but less accurate (Whisper needs context).
     live_buffer_seconds: float = 3.0
-    # Cosine similarity threshold for speaker re-identification.
-    # 0.70 = lenient (fewer "new speaker" false positives).
-    # 0.80 = strict (more accurate but may split one speaker into two).
-    live_similarity_threshold: float = 0.70
+    # Cosine distance threshold for Pyannote Wespeaker.
+    # Lower = stricter (requires embeddings to be closer to match).
+    live_wespeaker_threshold: float = 0.65
 
     @field_validator("language", "min_speakers", "max_speakers", mode="before")
     @classmethod
