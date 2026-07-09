@@ -7,108 +7,108 @@ Pipeline: FFmpeg preprocessing -> WhisperX (Whisper large-v3 + alignment +
 pyannote diarization) -> transcript formatting -> Ollama (llama3.1:8b /
 qwen3:8b) summarization.
 
-## Setup (macOS Local Testing)
+## 🚀 Quick Start Guide (From Zip File)
 
+Follow these steps in order to set up and run the pipeline locally on your machine (e.g., using **VS Code** or **Antigravity IDE**). 
+*(Note: This project is meant to be run in a local IDE environment, not in cloud notebook environments like Google Colab).*
+
+### 1. Unzip and Open in your IDE
+1. Extract the zip file you received.
+2. Open the unzipped folder directly in your IDE (**VS Code** or **Antigravity**).
+3. Open a new Integrated Terminal within your IDE. You should automatically be in the correct project folder.
+
+### 2. Install System Dependencies
+**For Windows:**
+Install FFmpeg using Winget (in Command Prompt or PowerShell):
+`winget install "FFmpeg (CLI)"`
+*(Alternatively, download from [ffmpeg.org](https://ffmpeg.org/) and add it to your system PATH).*
+
+**For macOS:**
 1. **Homebrew** — if not already installed:
    `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
-
 2. **FFmpeg**
    `brew install ffmpeg`
 
-3. **Python 3.11 virtual environment**
-   ```
-   python3.11 -m venv .venv
-   source .venv/bin/activate
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
+**For Linux / Cloud GPU:**
+`sudo apt update && sudo apt install ffmpeg`
 
-4. **Hugging Face token**
-   - Create a "Read" token: https://huggingface.co/settings/tokens
-   - Copy `.env.example` to `.env` and set `HF_TOKEN=<your token>`
+### 3. Set Up Python Environment
+Ensure you have Python 3.11 installed. Create and activate a virtual environment:
 
-5. **Accept pyannote model licenses** (required — diarization will fail
-   without this, even with a valid token). While logged into Hugging Face,
-   visit and accept the license on both:
-   - https://huggingface.co/pyannote/speaker-diarization-3.1
-   - https://huggingface.co/pyannote/segmentation-3.0
+**macOS / Linux:**
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+```
 
-6. **Install Ollama**
-   `brew install ollama`
-   then start the server: `ollama serve` (leave running in its own terminal,
-   or let the Ollama menu-bar app manage it)
+**Windows:**
+```cmd
+python -m venv .venv
+.venv\Scripts\activate
+```
 
-7. **Pull a model**
-   `ollama pull llama3.1:8b` (or `ollama pull qwen3:8b`)
-   Set whichever you choose as `OLLAMA_MODEL` in `.env`.
+Then, install dependencies:
+```bash
+pip install --upgrade pip
 
-8. **First run — sanity check the pipeline directly (no API yet)**
-   ```
-   python -c "
-   from pathlib import Path
-   from backend.transcribe import pipeline
-   from backend.utils import convert_to_wav
+# For Windows / macOS / CPU:
+pip install -r requirements.txt
 
-   wav = convert_to_wav(Path('uploads/your_test_file.mp3'))
-   result = pipeline.transcribe(wav)
-   print(result.language, len(result.segments), 'segments')
-   "
-   ```
+# For Linux/Windows with NVIDIA GPU (CUDA 12.1):
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# pip install -r requirements.txt
+```
 
-9. **Generate a transcript**
-   ```
-   python -c "
-   from backend.formatter import format_transcript, write_transcript_outputs
-   from backend.config import settings
-   transcript = format_transcript(result.segments)
-   write_transcript_outputs(transcript, settings.output_dir)
-   "
-   ```
+### 4. Configure Environment & Hugging Face Token
+1. **Copy the environment file**:
+   - **macOS / Linux**: `cp .env.example .env`
+   - **Windows**: `copy .env.example .env`
+2. **Create a "Read" token**: Visit [Hugging Face Tokens](https://huggingface.co/settings/tokens)
+3. **Edit `.env`**: Open the `.env` file and set `HF_TOKEN=<your token>`
+   *(For Cloud GPU users, also set `DEVICE=cuda` and `COMPUTE_TYPE=float16` if supported).*
 
-10. **Generate the AI summary**
-    ```
-    python -c "
-    from backend.summarize import summarizer, write_summary_outputs
-    from backend.config import settings
-    summary = summarizer.summarize(transcript)
-    write_summary_outputs(summary, settings.output_dir)
-    "
-    ```
+### 5. Accept Pyannote Model Licenses
+*(Required — diarization will fail without this, even with a valid token).* 
+While logged into Hugging Face, visit and accept the license on **both** of these pages:
+- https://huggingface.co/pyannote/speaker-diarization-3.1
+- https://huggingface.co/pyannote/segmentation-3.0
 
-11. **Run via FastAPI**
-    ```
-    uvicorn backend.app:app --reload
-    ```
-    Then:
-    ```
-    curl -X POST http://localhost:8000/transcribe \
-      -F "file=@uploads/your_test_file.mp3"
-    ```
-
-## Setup (Cloud GPU / Google Colab / Linux)
-
-To run **Whisper `large-v3`** at full speed, an NVIDIA GPU with at least 16GB VRAM is highly recommended. 
-
-1. **Clone the repository:**
-   `git clone https://github.com/Dheerajkurupati/STT-and-AI-Summary.git`
-2. **Install Requirements:**
-   If running on a Linux GPU server, ensure PyTorch is compiled for your CUDA version before installing `requirements.txt`:
+### 6. Install & Configure Ollama
+1. **Install Ollama**:
+   - **Windows**: Download and install from [ollama.com/download/windows](https://ollama.com/download/windows)
+   - **macOS**: `brew install ollama`
+   - **Linux**: `curl -fsSL https://ollama.com/install.sh | sh`
+2. **Start the Ollama server**:
    ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-   pip install -r requirements.txt
+   ollama serve
    ```
-3. **Configure the Environment:**
-   Copy `.env.example` to `.env` and set:
-   - `HF_TOKEN=<your token>`
-   - `WHISPER_MODEL=large-v3`
-   - `DEVICE=cuda`
-   - `COMPUTE_TYPE=float16`
-4. **Install Ollama (Linux):**
-   `curl -fsSL https://ollama.com/install.sh | sh`
-   `ollama serve &`
-   `ollama pull llama3.1:8b`
-5. **Start the Web Interface:**
-   `uvicorn backend.app:app --host 0.0.0.0 --port 8000`
+   *(Leave this running in its own terminal window, or let the Ollama menu-bar app manage it on macOS)*
+3. **Pull the AI Model** (in a new terminal window, make sure to navigate to the project directory):
+   ```bash
+   ollama pull llama3.1:8b
+   ```
+   *(You can also use `qwen3:8b`. Set whichever you choose as `OLLAMA_MODEL` in `.env`.)*
+
+### 7. Run the Application
+Ensure your virtual environment is activated (e.g. `source .venv/bin/activate` or `.venv\Scripts\activate`), then start the FastAPI server:
+```bash
+uvicorn backend.app:app --reload
+# Or for Linux/Cloud: uvicorn backend.app:app --host 0.0.0.0 --port 8000
+```
+
+### 8. Process an Audio File (Getting Output)
+With the server running, you can test the pipeline by submitting an audio file. Open a new terminal window and run:
+
+**macOS / Linux / Windows (Command Prompt / Git Bash):**
+```bash
+curl -X POST http://localhost:8000/transcribe -F "file=@uploads/your_test_file.mp3"
+```
+*(Replace `uploads/your_test_file.mp3` with the actual path to an audio or video file on your system. Note: On Windows PowerShell, `curl` may act differently; if so, please use standard Command Prompt).*
+
+**Viewing the Output:**
+Once the process finishes, the pipeline will generate several files in the `outputs/` directory in your project folder. You will find:
+- `transcript.txt` and `transcript.json` (Speaker diarized transcript)
+- `summary.txt` and `summary.json` (AI-generated meeting summary)
 
 ## Project structure
 

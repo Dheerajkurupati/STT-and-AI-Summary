@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,22 +8,24 @@
     <link rel="stylesheet" href="style.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
+
 <body>
     <div class="app-container">
         <header>
             <h1>Meeting AI</h1>
-            <p>Upload a recording to get a beautiful, speaker-separated transcript and AI summary.</p>
+            <p>Record live or upload a file — get a speaker-separated transcript and AI summary.</p>
         </header>
 
         <main>
             <section class="upload-section">
                 <!-- Live Recording Area -->
                 <div class="recording-container">
-                    <button id="startRecordBtn" class="primary-btn record-btn">🎙️ Start Recording Meeting</button>
+                    <button id="startRecordBtn" class="primary-btn record-btn">🎙️ Start Live Transcription</button>
                     <div id="recordingState" class="recording-state hidden">
                         <div class="recording-indicator"></div>
                         <span id="recordingTimer">00:00</span>
-                        <button id="stopRecordBtn" class="secondary-btn stop-btn">🛑 Stop & Transcribe</button>
+                        <span class="live-status-text">Listening… transcript appears below</span>
+                        <button id="stopRecordBtn" class="secondary-btn stop-btn">🛑 Stop</button>
                     </div>
                 </div>
 
@@ -35,36 +38,63 @@
                         <span id="file-name">Click to browse or drag a file here</span>
                         <input type="file" id="audioFile" name="file" accept="audio/*,video/*" required>
                     </label>
-                    <button type="submit" id="transcribeBtn" class="primary-btn" disabled>Generate Transcript from File</button>
+                    <button type="submit" id="transcribeBtn" class="primary-btn" disabled>Generate Transcript from
+                        File</button>
                 </form>
                 <div id="loading" class="hidden">
                     <div class="spinner"></div>
-                    <p>Processing audio (this may take a minute)...</p>
+                    <p>Processing audio (this may take a minute)…</p>
                 </div>
             </section>
 
+            <!-- ── Live transcript panel (shown while / after live recording) ── -->
+            <section id="liveSection" class="live-section hidden">
+                <div class="transcript-header">
+                    <h2>Live Transcript</h2>
+                    <span id="liveBadge" class="badge live-badge">🔴 LIVE</span>
+                </div>
+                <div id="liveTranscriptContainer" class="transcript-container live-transcript-container">
+                    <div id="liveEmptyState" class="live-empty-state">
+                        <div class="spinner small"></div>
+                        <span>Waiting for speech…</span>
+                    </div>
+                </div>
+                <div class="summary-action">
+                    <button id="liveSummaryBtn" class="primary-btn ai-btn hidden">✨ Generate AI Summary</button>
+                    <div id="liveSummaryLoading" class="hidden">
+                        <div class="spinner small"></div>
+                        <span>Ollama is thinking…</span>
+                    </div>
+                </div>
+                <div id="liveSummaryContainer" class="summary-container hidden">
+                    <h2>AI Summary</h2>
+                    <div id="liveSummaryContent" class="summary-content"></div>
+                </div>
+            </section>
+
+            <!-- ── Batch results (shown after file upload) ── -->
             <section id="resultsSection" class="results-section hidden">
                 <div class="transcript-header">
                     <h2>Transcript</h2>
                     <span id="metaInfo" class="badge"></span>
                 </div>
-                
+
                 <div id="transcriptContainer" class="transcript-container">
-                    <!-- Transcript blocks will be injected here -->
+                    <!-- Transcript blocks injected by app.js -->
                 </div>
 
                 <div class="summary-action">
                     <button id="summaryBtn" class="primary-btn ai-btn">✨ Generate AI Summary</button>
                     <div id="summaryLoading" class="hidden">
                         <div class="spinner small"></div>
-                        <span>Ollama is thinking...</span>
+                        <span>Ollama is thinking…</span>
                     </div>
                 </div>
 
                 <div id="summaryContainer" class="summary-container hidden">
                     <h2>AI Summary</h2>
                     <div id="summaryContent" class="summary-content">
-                        <!-- Summary will be injected here -->
+                        <!-- Summary injected here -->
                     </div>
                 </div>
             </section>
@@ -72,4 +102,5 @@
     </div>
     <script src="app.js"></script>
 </body>
+
 </html>

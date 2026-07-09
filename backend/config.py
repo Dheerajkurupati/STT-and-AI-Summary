@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     min_speakers: int | None = None
     max_speakers: int | None = None
 
+    # --- Live Streaming ---
+    # Whisper model for the real-time path. "base" is fast enough on CPU for
+    # 3-second chunks (~0.3s latency). Upgrade to "small" or "medium" via
+    # .env if you want higher accuracy at the cost of latency.
+    live_whisper_model: str = "base"
+    # How many seconds of audio to buffer before each transcription pass.
+    # Lower = more responsive but less accurate (Whisper needs context).
+    live_buffer_seconds: float = 3.0
+    # Cosine similarity threshold for speaker re-identification.
+    # 0.70 = lenient (fewer "new speaker" false positives).
+    # 0.80 = strict (more accurate but may split one speaker into two).
+    live_similarity_threshold: float = 0.70
+
     @field_validator("language", "min_speakers", "max_speakers", mode="before")
     @classmethod
     def empty_str_to_none(cls, v: Any) -> Any:

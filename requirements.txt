@@ -23,6 +23,18 @@ whisperx @ git+https://github.com/m-bain/whisperX.git
 # pyannote.audio is pulled in automatically as a WhisperX dependency —
 # it is never imported directly outside backend/transcribe.py.
 
+# --- Live streaming transcription ---
+# faster-whisper: CTranslate2-based Whisper — 4x faster than original,
+# used exclusively in the live path (batch path keeps WhisperX large-v3).
+faster-whisper>=1.0.0
+# resemblyzer: speaker voice embedding model (d-vector, MIT license).
+# Used in stream.py to compare voice prints across live audio chunks so
+# Speaker 1 at minute 0 stays Speaker 1 at minute 10.
+resemblyzer>=0.1.4
+# setuptools<70.0.0 is strictly required because resemblyzer's dependency 
+# (webrtcvad) relies on pkg_resources, which was removed in setuptools 70+.
+setuptools<70.0.0
+
 # --- LLM (Ollama) ---
 ollama>=0.3.0
 

@@ -22,17 +22,19 @@ first request pays the cost, every request after is fast.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.config import settings
 from backend.formatter import format_transcript, transcript_to_dict, write_transcript_outputs
+from backend.stream import LiveTranscriptionSession
 from backend.summarize import SummarizationError, summarizer, write_summary_outputs
 from backend.transcribe import TranscriptionError, pipeline
 from backend.utils import (
@@ -64,6 +66,51 @@ def health() -> dict:
     """Liveness check. Deliberately does not touch WhisperX/Ollama, so it
     stays fast and doesn't trigger model loading."""
     return {"status": "ok"}
+
+
+@app.websocket("/ws/live")
+async def live_transcription(websocket: WebSocket) -> None:
+    """
+    Real-time transcription WebSocket endpoint.
+
+    Protocol:
+      - Client sends raw int16 LE PCM bytes (16 kHz, mono) continuously.
+      - Server replies with JSON objects as speech is detected:
+          {"speaker": "Speaker 1", "text": "Hello everyone", "timestamp": "00:06"}
+      - Client closes the connection to end the session.
+
+    One LiveTranscriptionSession is created per connection. Sessions are
+    fully isolated — concurrent connections do not share state.
+    """
+    await websocket.accept()
+    session = LiveTranscriptionSession()
+    logger.info("Live transcription session started")
+
+    try:
+        while True:
+            # Receive raw PCM bytes from the browser's ScriptProcessorNode
+            audio_bytes = await websocket.receive_bytes()
+
+            # process_chunk is CPU-bound (model inference) — run in thread
+            # pool so we don't block FastAPI's async event loop.
+            loop = asyncio.get_event_loop()
+            # process_chunk returns a list — one LiveChunk per VAD segment.
+            # Empty list = still buffering or silence. Each chunk is sent
+            # separately so the browser renders them as they arrive.
+            chunks = await loop.run_in_executor(None, session.process_chunk, audio_bytes)
+            for chunk in chunks:
+                await websocket.send_json({
+                    "speaker": chunk.speaker,
+                    "text": chunk.text,
+                    "timestamp": chunk.timestamp,
+                    "start_seconds": chunk.start_seconds,
+                })
+    except WebSocketDisconnect:
+        logger.info("Live session disconnected normally")
+    except Exception as exc:
+        logger.error("Live session error: %s", exc)
+    finally:
+        session.cleanup()
 
 
 
