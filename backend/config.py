@@ -61,8 +61,8 @@ class Settings(BaseSettings):
 
     # --- Diarization ---
     diarization_model: str = "pyannote/speaker-diarization-3.1"
-    min_speakers: int | None = None
-    max_speakers: int | None = None
+    min_speakers: int | None = 1
+    max_speakers: int | None = 7
 
     # --- Live Streaming ---
     # Whisper model for the real-time path. "base" is fast enough on CPU for
@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # 0.70 = lenient (fewer "new speaker" false positives).
     # 0.80 = strict (more accurate but may split one speaker into two).
     live_similarity_threshold: float = 0.70
+    # Enable speaker diarization (speaker tracking via Resemblyzer) in the live path.
+    # Set to False to run 100% in the cloud (instantaneous, no local PyTorch model on CPU).
+    enable_live_diarization: bool = False
 
     @field_validator("language", "min_speakers", "max_speakers", mode="before")
     @classmethod
@@ -102,6 +105,12 @@ class Settings(BaseSettings):
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "llama3.1:8b"
     ollama_request_timeout: int = 300
+
+    # --- Groq ---
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.1-8b-instant"
+    groq_whisper_model: str = "whisper-large-v3"
+    groq_request_timeout: int = 60
 
     # --- Summarization chunking ---
     # Rough word-count budget per chunk sent to the LLM. Kept conservative

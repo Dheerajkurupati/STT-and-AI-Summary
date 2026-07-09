@@ -31,7 +31,8 @@ from backend.config import settings
 from backend.formatter import MeetingTranscript
 from backend.prompts import (
     SYSTEM_PROMPT,
-    build_chunk_summary_prompt,
+    build_chunk_extract_prompt,
+    build_chunk_summary_prompt,  # legacy alias
     build_final_summary_prompt,
 )
 from backend.utils import get_logger
@@ -65,13 +66,18 @@ def _transcript_to_llm_text(transcript: MeetingTranscript) -> list[str]:
     return [f"{block.speaker_label}: {block.text}" for block in transcript.blocks]
 
 
-def _split_into_chunks(lines: list[str], max_words: int) -> list[str]:
+def _split_into_chunks(lines: list[str], max_words: int, overlap_lines: int = 3) -> list[str]:
     """
-    Group transcript lines into chunks under a word budget, splitting only
-    at line boundaries so a sentence is never cut mid-way. If a single line
-    alone exceeds max_words (an unusually long uninterrupted turn), it
-    becomes its own oversized chunk rather than being split further —
-    accepted as a rare edge case.
+    Group transcript lines into overlapping chunks under a word budget.
+
+    Each chunk ends at a line boundary so sentences are never split mid-way.
+    The last `overlap_lines` lines of each chunk are repeated at the start of
+    the next chunk so context isn't lost at boundaries — important for the
+    RAG extraction pass where the model needs to see who is speaking and what
+    was just said before it starts reading the new window.
+
+    If a single line alone exceeds max_words (an unusually long uninterrupted
+    turn), it becomes its own oversized chunk — accepted as a rare edge case.
     """
     chunks: list[str] = []
     current_lines: list[str] = []
@@ -81,8 +87,11 @@ def _split_into_chunks(lines: list[str], max_words: int) -> list[str]:
         word_count = len(line.split())
         if current_lines and current_words + word_count > max_words:
             chunks.append("\n".join(current_lines))
-            current_lines = []
-            current_words = 0
+            # Carry the last `overlap_lines` lines into the next chunk so
+            # the model retains speaker/topic context across the boundary.
+            tail = current_lines[-overlap_lines:] if len(current_lines) > overlap_lines else current_lines[:]
+            current_lines = tail
+            current_words = sum(len(l.split()) for l in current_lines)
         current_lines.append(line)
         current_words += word_count
 
@@ -107,6 +116,42 @@ class SummarizerService:
                 timeout=settings.ollama_request_timeout,
             )
         return self._client
+
+    def _call_groq_json(self, prompt: str) -> dict:
+        """Send one prompt to Groq API and parse the response as JSON."""
+        from openai import OpenAI
+        
+        client = OpenAI(
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+            timeout=settings.groq_request_timeout,
+        )
+        try:
+            response = client.chat.completions.create(
+                model=settings.groq_model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,   # Low temperature → deterministic, factual output
+                max_tokens=4096,   # Enough for a full structured summary
+            )
+        except Exception as exc:
+            raise SummarizationError(
+                f"Failed to query Groq API using model '{settings.groq_model}': {exc}"
+            ) from exc
+
+        content = response.choices[0].message.content
+        if not content:
+            raise SummarizationError("Groq API returned an empty response.")
+            
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise SummarizationError(
+                f"Groq returned non-JSON content despite response_format: {content[:200]}"
+            ) from exc
 
     def _call_ollama_json(self, prompt: str) -> dict:
         """
@@ -141,35 +186,64 @@ class SummarizerService:
                 f"Ollama returned non-JSON content despite format='json': {content[:200]}"
             ) from exc
 
+    def _call_llm_json(self, prompt: str) -> dict:
+        """Routes the prompt to either Groq or Ollama depending on configuration."""
+        if settings.groq_api_key:
+            logger.info("Using Groq API for summarization (Model: %s)", settings.groq_model)
+            return self._call_groq_json(prompt)
+        else:
+            logger.info("Using Ollama for summarization (Model: %s)", settings.ollama_model)
+            return self._call_ollama_json(prompt)
+
     def _summarize_chunk(self, chunk_text: str, index: int, total: int) -> dict:
-        logger.info("Summarizing chunk %d/%d", index, total)
-        prompt = build_chunk_summary_prompt(chunk_text, index, total)
-        return self._call_ollama_json(prompt)
+        """MAP phase: extract structured facts from one transcript chunk."""
+        logger.info("Extracting facts from chunk %d/%d", index, total)
+        prompt = build_chunk_extract_prompt(chunk_text, index, total)
+        raw = self._call_llm_json(prompt)
+        # Normalise keys — the extraction prompt uses different field names
+        # from the final summary schema, so we pass them through as-is.
+        # The REDUCE prompt is designed to accept this shape.
+        return raw
 
     def summarize(self, transcript: MeetingTranscript) -> SummaryResult:
         """
-        Full summarization entry point. Chunks only if the transcript
-        exceeds max_words_per_chunk; otherwise sends it in one call.
+        Full RAG map-reduce summarization pipeline.
+
+        MAP:    Split transcript into overlapping word-budgeted chunks.
+                Each chunk → _summarize_chunk() → structured fact extraction.
+        REDUCE: All chunk extractions → one final LLM call → deduplicated,
+                narrative-quality summary with all required fields.
+
+        Short transcripts (≤ max_words_per_chunk) skip the MAP phase and go
+        straight to REDUCE with the raw transcript — no reason to pay for two
+        LLM calls when one fits comfortably.
         """
         lines = _transcript_to_llm_text(transcript)
         if not lines:
             logger.warning("Empty transcript passed to summarize(); returning empty summary")
             return SummaryResult()
 
+        total_words = sum(len(l.split()) for l in lines)
+        logger.info("Transcript word count: %d (chunk budget: %d)", total_words, settings.max_words_per_chunk)
+
         chunks = _split_into_chunks(lines, settings.max_words_per_chunk)
 
         if len(chunks) == 1:
+            # Short transcript — send raw text straight to the REDUCE prompt.
+            logger.info("Single-chunk transcript — skipping MAP phase")
             final_prompt = build_final_summary_prompt(chunks[0], from_chunk_summaries=False)
         else:
-            logger.info("Transcript split into %d chunks for summarization", len(chunks))
-            chunk_summaries = [
+            # Long transcript — MAP each chunk, then REDUCE the extractions.
+            logger.info("Transcript split into %d chunks — running MAP phase", len(chunks))
+            chunk_extractions = [
                 self._summarize_chunk(chunk, i, len(chunks))
                 for i, chunk in enumerate(chunks, start=1)
             ]
-            combined = json.dumps(chunk_summaries, indent=2)
+            combined = json.dumps(chunk_extractions, indent=2)
+            logger.info("MAP phase complete — running REDUCE phase")
             final_prompt = build_final_summary_prompt(combined, from_chunk_summaries=True)
 
-        raw = self._call_ollama_json(final_prompt)
+        raw = self._call_llm_json(final_prompt)
 
         return SummaryResult(
             executive_summary=raw.get("executive_summary", ""),

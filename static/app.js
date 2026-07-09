@@ -72,6 +72,7 @@ async function submitToBackend(formData) {
         document.querySelector('.recording-container').classList.remove('hidden');
         document.querySelector('.divider').classList.remove('hidden');
         document.getElementById('resultsSection').classList.remove('hidden');
+        document.getElementById('translateBtn').classList.remove('hidden');
 
     } catch (error) {
         alert('Transcription failed: ' + error.message);
@@ -199,6 +200,7 @@ function stopLiveRecording() {
     document.getElementById('liveBadge').textContent = '✅ Done';
     if (liveChunks.length > 0) {
         document.getElementById('liveSummaryBtn').classList.remove('hidden');
+        document.getElementById('liveTranslateBtn').classList.remove('hidden');
     }
 }
 
@@ -379,4 +381,93 @@ document.getElementById('summaryBtn').addEventListener('click', async function (
         document.getElementById('summaryLoading').classList.add('hidden');
         this.classList.remove('hidden');
     }
+});
+
+// ── Translation Logic ────────────────────────────────────────────────────────
+async function translateTranscriptBlocks(blocksToTranslate, isLive, chunkMapping = null) {
+    if (!blocksToTranslate || !blocksToTranslate.length) return;
+    
+    const btn = isLive ? document.getElementById('liveTranslateBtn') : document.getElementById('translateBtn');
+    const originalText = btn.textContent;
+    btn.textContent = 'Translating...';
+    btn.disabled = true;
+
+    try {
+        const response = await fetch('/api/translate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ blocks: blocksToTranslate }),
+        });
+
+        if (!response.ok) throw new Error(`Server ${response.status}: ${await response.text()}`);
+
+        const data = await response.json();
+        
+        // Update DOM and local state
+        const containerId = isLive ? 'liveTranscriptContainer' : 'transcriptContainer';
+        const container = document.getElementById(containerId);
+        const blockEls = container.querySelectorAll('.transcript-block');
+        
+        data.blocks.forEach((translatedBlock, index) => {
+            // Update UI
+            if (blockEls[index]) {
+                const textEl = blockEls[index].querySelector('.transcript-text');
+                if (textEl) {
+                    textEl.textContent = translatedBlock.text;
+                }
+            }
+            
+            // Update underlying state so summary (if clicked later) uses translated text
+            if (isLive) {
+                if (chunkMapping && chunkMapping[index]) {
+                    const indices = chunkMapping[index];
+                    indices.forEach((chunkIdx, i) => {
+                        if (i === 0) {
+                            liveChunks[chunkIdx].text = translatedBlock.text;
+                        } else {
+                            liveChunks[chunkIdx].text = '';
+                        }
+                    });
+                }
+            } else {
+                currentTranscriptData.blocks[index].text = translatedBlock.text;
+            }
+        });
+        
+        btn.textContent = 'Translated ✅';
+    } catch (error) {
+        alert('Translation failed: ' + error.message);
+        btn.textContent = originalText;
+        btn.disabled = false;
+    }
+}
+
+document.getElementById('translateBtn').addEventListener('click', () => {
+    if (!currentTranscriptData || !currentTranscriptData.blocks) return;
+    translateTranscriptBlocks(currentTranscriptData.blocks, false);
+});
+
+document.getElementById('liveTranslateBtn').addEventListener('click', () => {
+    if (!liveChunks.length) return;
+    
+    // Merge liveChunks for translation so they match the DOM blocks
+    const mergedBlocks = [];
+    const chunkMapping = []; // maps merged block index -> array of raw chunk indices
+    
+    liveChunks.forEach((chunk, chunkIdx) => {
+        const last = mergedBlocks[mergedBlocks.length - 1];
+        if (last && last.speaker_label === chunk.speaker) {
+            last.text += ' ' + chunk.text;
+            chunkMapping[chunkMapping.length - 1].push(chunkIdx);
+        } else {
+            mergedBlocks.push({
+                speaker_label: chunk.speaker,
+                timestamp: chunk.timestamp,
+                text: chunk.text
+            });
+            chunkMapping.push([chunkIdx]);
+        }
+    });
+    
+    translateTranscriptBlocks(mergedBlocks, true, chunkMapping);
 });

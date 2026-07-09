@@ -197,6 +197,25 @@ def summarize_meeting_api(req: SummarizeRequest) -> JSONResponse:
     except SummarizationError as exc:
         logger.error("Summarization failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+class TranslateRequest(BaseModel):
+    blocks: list[dict]
+
+@app.post("/api/translate")
+def translate_transcript_api(req: TranslateRequest) -> JSONResponse:
+    from backend.translate import translate_to_english
+    
+    try:
+        translated_blocks = []
+        for block in req.blocks:
+            translated_text = translate_to_english(block.get("text", ""))
+            translated_blocks.append({
+                **block,
+                "text": translated_text
+            })
+        return JSONResponse({"blocks": translated_blocks})
+    except Exception as exc:
+        logger.error("Translation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Translation failed") from exc
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

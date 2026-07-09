@@ -51,7 +51,10 @@
             <section id="liveSection" class="live-section hidden">
                 <div class="transcript-header">
                     <h2>Live Transcript</h2>
-                    <span id="liveBadge" class="badge live-badge">🔴 LIVE</span>
+                    <div>
+                        <button id="liveTranslateBtn" class="secondary-btn small-btn hidden">🌐 Translate to English</button>
+                        <span id="liveBadge" class="badge live-badge">🔴 LIVE</span>
+                    </div>
                 </div>
                 <div id="liveTranscriptContainer" class="transcript-container live-transcript-container">
                     <div id="liveEmptyState" class="live-empty-state">
@@ -76,7 +79,10 @@
             <section id="resultsSection" class="results-section hidden">
                 <div class="transcript-header">
                     <h2>Transcript</h2>
-                    <span id="metaInfo" class="badge"></span>
+                    <div>
+                        <button id="translateBtn" class="secondary-btn small-btn hidden">🌐 Translate to English</button>
+                        <span id="metaInfo" class="badge"></span>
+                    </div>
                 </div>
 
                 <div id="transcriptContainer" class="transcript-container">

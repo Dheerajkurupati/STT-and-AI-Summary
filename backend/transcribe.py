@@ -112,11 +112,391 @@ class WhisperXPipeline:
             )
         return self._diarize_pipeline
 
+    def _diarize_with_pyannote(self, audio_path: Path, segments: list[RawSegment]) -> list[RawSegment]:
+        if len(segments) <= 1:
+            return segments
+
+        import whisperx
+        
+        logger.info("Performing Pyannote audio-based diarization to label Groq segments")
+        try:
+            # Load audio for pyannote
+            audio = whisperx.load_audio(str(audio_path))
+            
+            # Run diarization pipeline
+            diarize_pipeline = self._load_diarize_pipeline()
+            diarization = diarize_pipeline(
+                audio,
+                min_speakers=settings.min_speakers,
+                max_speakers=settings.max_speakers,
+            )
+            
+            # Match pyannote output (pandas DataFrame) with Groq text segments based on time overlap
+            for seg in segments:
+                seg_start = seg.start
+                seg_end = seg.end
+                best_speaker = "Speaker 1"
+                max_overlap = 0.0
+                
+                for _, row in diarization.iterrows():
+                    d_start = row["start"]
+                    d_end = row["end"]
+                    
+                    # Calculate intersection
+                    overlap = max(0, min(seg_end, d_end) - max(seg_start, d_start))
+                    if overlap > max_overlap:
+                        max_overlap = overlap
+                        
+                        # Convert SPEAKER_00 to Speaker 1, etc.
+                        speaker_label = row["speaker"]
+                        if speaker_label.startswith("SPEAKER_"):
+                            try:
+                                num = int(speaker_label.split("_")[1]) + 1
+                                best_speaker = f"Speaker {num}"
+                            except ValueError:
+                                best_speaker = speaker_label
+                        else:
+                            best_speaker = speaker_label
+                            
+                if max_overlap > 0:
+                    seg.speaker = best_speaker
+
+            unique_speakers = set(seg.speaker for seg in segments)
+            logger.info(f"Pyannote diarization complete: {len(unique_speakers)} unique speakers detected")
+            
+        except Exception as exc:
+            logger.warning("Pyannote diarization failed: %s.", exc)
+            raise
+
+    def _diarize_with_resemblyzer(self, audio_path: Path, segments: list[RawSegment]) -> list[RawSegment]:
+        if len(segments) <= 1:
+            return segments
+
+        import soundfile as sf
+        import numpy as np
+        from resemblyzer import VoiceEncoder, preprocess_wav
+        from sklearn.cluster import AgglomerativeClustering
+
+        logger.info("Performing Resemblyzer audio-based diarization to label Groq segments")
+        try:
+            # Load audio data
+            wav_data, sr = sf.read(str(audio_path))
+            duration = len(wav_data) / sr
+
+            # Bin-based clustering to get stable embeddings
+            bin_duration = 5.0
+            bins = []
+            t = 0.0
+            while t < duration:
+                end = min(t + bin_duration, duration)
+                bins.append((t, end))
+                t += bin_duration
+
+            # Initialize VoiceEncoder
+            encoder = VoiceEncoder()
+
+            embeddings = []
+            valid_bins = []
+            for idx, (start_t, end_t) in enumerate(bins):
+                start_sample = int(start_t * sr)
+                end_sample = int(end_t * sr)
+                audio_slice = wav_data[start_sample:end_sample]
+
+                if len(audio_slice) < 16000:  # Needs at least 1s of audio to be stable
+                    continue
+
+                processed = preprocess_wav(audio_slice, source_sr=sr)
+                embed = encoder.embed_utterance(processed)
+                embeddings.append(embed)
+                valid_bins.append(idx)
+
+            if not embeddings:
+                logger.warning("No valid speaker embeddings extracted. Defaulting all to Speaker 1.")
+                return segments
+
+            embeddings = np.array(embeddings)
+            # L2 normalize
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings_norm = embeddings / (norms + 1e-8)
+
+            # Determine clustering constraints
+            min_speakers = settings.min_speakers
+            max_speakers = settings.max_speakers
+
+            n_clusters = None
+            distance_threshold = 0.25  # Cosine distance threshold (tuned for Resemblyzer speaker verification)
+
+            # If min_speakers and max_speakers are equal and set, enforce that exact number of clusters
+            if min_speakers and min_speakers == max_speakers:
+                n_clusters = min_speakers
+                distance_threshold = None
+
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                distance_threshold=distance_threshold,
+                metric="cosine",
+                linkage="average"
+            )
+            labels = clustering.fit_predict(embeddings_norm)
+            n_speakers = len(set(labels))
+
+            # Enforce speaker bounds if n_clusters was not hardcoded
+            if n_clusters is None:
+                if min_speakers and n_speakers < min_speakers:
+                    logger.info(f"Detected {n_speakers} speakers, forcing min_speakers={min_speakers}")
+                    clustering = AgglomerativeClustering(
+                        n_clusters=min_speakers,
+                        metric="cosine",
+                        linkage="average"
+                    )
+                    labels = clustering.fit_predict(embeddings_norm)
+                elif max_speakers and n_speakers > max_speakers:
+                    logger.info(f"Detected {n_speakers} speakers, forcing max_speakers={max_speakers}")
+                    clustering = AgglomerativeClustering(
+                        n_clusters=max_speakers,
+                        metric="cosine",
+                        linkage="average"
+                    )
+                    labels = clustering.fit_predict(embeddings_norm)
+
+            # Map valid bin index to cluster label
+            bin_to_label = {bin_idx: label for bin_idx, label in zip(valid_bins, labels)}
+
+            # Map cluster labels to Speaker 1, Speaker 2, etc. in order of appearance
+            speaker_map = {}
+            next_speaker_num = 1
+
+            # Match segments to bins and assign speakers
+            for seg in segments:
+                # Find overlapping bins and sum up their overlap duration
+                best_label = None
+                max_overlap = 0.0
+
+                for bin_idx, (b_start, b_end) in enumerate(bins):
+                    if bin_idx not in bin_to_label:
+                        continue
+                    overlap = max(0, min(seg.end, b_end) - max(seg.start, b_start))
+                    if overlap > max_overlap:
+                        max_overlap = overlap
+                        best_label = bin_to_label[bin_idx]
+
+                if best_label is None:
+                    best_label = labels[0] if len(labels) > 0 else 0
+
+                if best_label not in speaker_map:
+                    speaker_map[best_label] = f"Speaker {next_speaker_num}"
+                    next_speaker_num += 1
+
+                seg.speaker = speaker_map[best_label]
+
+            unique_speakers = set(seg.speaker for seg in segments)
+            logger.info("Resemblyzer diarization complete: %d unique speakers detected", len(unique_speakers))
+
+        except Exception as exc:
+            logger.error("Resemblyzer diarization failed: %s. Defaulting all to Speaker 1.", exc, exc_info=True)
+
+        return segments
+
+    def _diarize_with_llm(self, segments: list[RawSegment]) -> list[RawSegment]:
+        if len(segments) <= 1:
+            return segments
+
+        logger.info("Performing LLM-based semantic diarization fallback")
+        from backend.prompts import LLM_DIARIZATION_PROMPT_TEMPLATE, SYSTEM_PROMPT        
+        lines = []
+        for i, seg in enumerate(segments, 1):
+            lines.append(f"{i}: {seg.text}")
+            
+        prompt = LLM_DIARIZATION_PROMPT_TEMPLATE.format(content="\n".join(lines))
+
+        try:
+            if settings.groq_api_key:
+                from openai import OpenAI
+                client = OpenAI(
+                    api_key=settings.groq_api_key,
+                    base_url="https://api.groq.com/openai/v1",
+                    timeout=settings.groq_request_timeout,
+                )
+                response = client.chat.completions.create(
+                    model=settings.groq_model,
+                    messages=[
+                        {"role": "system", "content": "You are a data processing API. Output ONLY plain text mappings (e.g. '1: Speaker 1'). Do not include explanations."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=4096,
+                )
+                content = response.choices[0].message.content
+            else:
+                import ollama
+                client = ollama.Client(host=settings.ollama_host, timeout=settings.ollama_request_timeout)
+                response = client.chat(
+                    model=settings.ollama_model,
+                    messages=[
+                        {"role": "system", "content": "You are a data processing API. Output ONLY plain text mappings (e.g. '1: Speaker 1'). Do not include explanations."},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                content = response["message"]["content"]
+            
+            # Parse the numbered lines
+            parsed_count = 0
+            for line in content.splitlines():
+                line = line.strip()
+                if ":" in line:
+                    parts = line.split(":", 1)
+                    num_str = parts[0].strip()
+                    speaker = parts[1].strip().replace("*", "").replace("`", "")
+                    if num_str.isdigit():
+                        idx = int(num_str) - 1
+                        if 0 <= idx < len(segments):
+                            segments[idx].speaker = speaker
+                            parsed_count += 1
+            
+            unique_speakers = set(seg.speaker for seg in segments)
+            logger.info("LLM diarization complete: %d unique speakers detected across %d mapped segments", len(unique_speakers), parsed_count)
+
+        except Exception as exc:
+            logger.error("LLM diarization failed: %s", exc)
+
+        return segments
+
+    def _diarize(self, audio_path: Path, segments: list[RawSegment]) -> list[RawSegment]:
+        result = segments
+        if settings.hf_token:
+            logger.info("HF_TOKEN is set. Attempting Pyannote diarization first.")
+            try:
+                result = self._diarize_with_pyannote(audio_path, segments)
+            except Exception as exc:
+                logger.warning("Pyannote diarization failed: %s. Falling back to Resemblyzer.", exc)
+                result = self._diarize_with_resemblyzer(audio_path, segments)
+        else:
+            result = self._diarize_with_resemblyzer(audio_path, segments)
+            
+        # Check if audio-based diarization failed to find multiple speakers
+        unique_speakers = set(seg.speaker for seg in result)
+        if len(unique_speakers) <= 1 and len(result) > 1:
+            logger.warning("Audio-based diarization detected only 1 speaker. Cascading to LLM fallback.")
+            result = self._diarize_with_llm(result)
+            
+        return result
+
+    def _transcribe_groq(self, audio_path: Path) -> TranscriptionResult:
+        from openai import OpenAI
+        from backend.formatter import RawSegment
+        import json
+
+        logger.info("Using Groq API for batch transcription (Model: %s)", settings.groq_whisper_model)
+        client = OpenAI(
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+            timeout=settings.groq_request_timeout,
+        )
+
+        try:
+            with open(audio_path, "rb") as audio_file:
+                response = client.audio.transcriptions.create(
+                    file=(audio_path.name, audio_file, "audio/wav"),
+                    model=settings.groq_whisper_model,
+                    response_format="verbose_json",
+                    language=settings.language if settings.language else None,
+                    timestamp_granularities=["word"],
+                )
+        except Exception as exc:
+            raise TranscriptionError(f"Groq transcription API failed: {exc}") from exc
+
+        response_dict = getattr(response, "model_dump", lambda: None)() or response
+        if isinstance(response_dict, str):
+            response_dict = json.loads(response_dict)
+
+        raw_segments_list = response_dict.get("segments", [])
+        words_list = response_dict.get("words", [])
+        detected_language = response_dict.get("language", "en")
+        if len(detected_language) > 2:
+            detected_language = detected_language[:2].lower()
+
+        segments: list[RawSegment] = []
+
+        if words_list:
+            logger.info("Reconstructing sentence-level segments from word-level timestamps for precise diarization")
+            current_words = []
+            for i, w in enumerate(words_list):
+                current_words.append(w)
+                word_text = w.get("word", "")
+
+                # Check for segment boundary conditions:
+                # 1. Word ends with sentence punctuation (. ? !)
+                # 2. Significant silence/gap before next word
+                # 3. Maximum word count reached to keep segments short
+                is_sentence_end = any(word_text.endswith(p) for p in [".", "?", "!"])
+                
+                has_gap = False
+                if i < len(words_list) - 1:
+                    next_w = words_list[i+1]
+                    gap = next_w.get("start", 0) - w.get("end", 0)
+                    if gap > 1.0:
+                        has_gap = True
+
+                if is_sentence_end or has_gap or len(current_words) >= 20:
+                    text = " ".join([cw.get("word", "") for cw in current_words]).strip()
+                    if text:
+                        segments.append(
+                            RawSegment(
+                                start=float(current_words[0]["start"]),
+                                end=float(current_words[-1]["end"]),
+                                text=text,
+                                speaker="Speaker 1",
+                            )
+                        )
+                    current_words = []
+
+            # Add any trailing words
+            if current_words:
+                text = " ".join([cw.get("word", "") for cw in current_words]).strip()
+                if text:
+                    segments.append(
+                        RawSegment(
+                            start=float(current_words[0]["start"]),
+                            end=float(current_words[-1]["end"]),
+                            text=text,
+                            speaker="Speaker 1",
+                        )
+                    )
+        else:
+            # Fallback to standard segments if words list is not present
+            logger.warning("No word-level timestamps returned by Groq. Falling back to default segments.")
+            for seg in raw_segments_list:
+                text = (seg.get("text") or "").strip()
+                if not text:
+                    continue
+                segments.append(
+                    RawSegment(
+                        start=float(seg["start"]),
+                        end=float(seg["end"]),
+                        text=text,
+                        speaker="Speaker 1",
+                    )
+                )
+
+        # Apply diarization (Pyannote or Resemblyzer fallback)
+        segments = self._diarize(audio_path, segments)
+
+        duration = response_dict.get("duration", max((s.end for s in segments), default=0.0))
+
+        return TranscriptionResult(
+            segments=segments,
+            language=detected_language,
+            duration_seconds=duration,
+        )
+
     def transcribe(self, audio_path: Path) -> TranscriptionResult:
         """
-        Run the full WhisperX pipeline on a preprocessed (mono, 16kHz WAV)
-        audio file: transcribe -> align -> diarize -> assign speakers.
+        Run the transcription pipeline on a preprocessed (mono, 16kHz WAV)
+        audio file. Uses Groq API if settings.groq_api_key is set, otherwise WhisperX.
         """
+        if settings.groq_api_key:
+            return self._transcribe_groq(audio_path)
+
         import whisperx
 
         try:
@@ -148,19 +528,28 @@ class WhisperXPipeline:
                 return_char_alignments=False,
             )
 
-            diarize_pipeline = self._load_diarize_pipeline()
-            diarization = diarize_pipeline(
-                audio,
-                min_speakers=settings.min_speakers,
-                max_speakers=settings.max_speakers,
-            )
-            result = whisperx.assign_word_speakers(diarization, aligned)
+            if settings.hf_token:
+                try:
+                    diarize_pipeline = self._load_diarize_pipeline()
+                    diarization = diarize_pipeline(
+                        audio,
+                        min_speakers=settings.min_speakers,
+                        max_speakers=settings.max_speakers,
+                    )
+                    result = whisperx.assign_word_speakers(diarization, aligned)
+                    segments = self._to_raw_segments(result["segments"])
+                except Exception as exc:
+                    logger.warning("Local Pyannote diarization failed: %s. Falling back to Resemblyzer.", exc)
+                    segments = self._to_raw_segments(aligned["segments"])
+                    segments = self._diarize_with_resemblyzer(audio_path, segments)
+            else:
+                logger.info("HF_TOKEN not set. Using Resemblyzer for local diarization fallback.")
+                segments = self._to_raw_segments(aligned["segments"])
+                segments = self._diarize_with_resemblyzer(audio_path, segments)
         except TranscriptionError:
             raise
         except Exception as exc:
             raise TranscriptionError(f"WhisperX pipeline failed on {audio_path}: {exc}") from exc
-
-        segments = self._to_raw_segments(result["segments"])
         duration = max((s.end for s in segments), default=0.0)
 
         return TranscriptionResult(
