@@ -71,41 +71,29 @@ class LiveTranscriptionSession:
     """
 
     def __init__(self) -> None:
-        self._whisper = None          # faster_whisper.WhisperModel, loaded lazily
-        self._voice_encoder = None    # resemblyzer.VoiceEncoder, loaded lazily
+        self._voice_encoder: Any = None
+        self._groq_client: Any = None
+        
+        # Audio buffer (raw float32 samples at 16kHz)
         self._buffer = np.zeros(0, dtype=np.float32)
-        # 5s buffer gives resemblyzer more voice data for stable embeddings,
-        # which drastically reduces "same person detected as new speaker" false positives.
-        self._buffer_samples = int(SAMPLE_RATE * settings.live_buffer_seconds)
-        # NO overlap: overlap was causing the same words to appear twice at
-        # chunk boundaries (e.g. "incorporate that. of how you incorporate that.").
-        # faster-whisper's built-in VAD handles boundary words correctly on its own.
-        self._overlap_samples = 0
-        self._speaker_profiles: dict[str, np.ndarray] = {}   # label -> avg embedding
-        self._speaker_counts: dict[str, int] = {}             # label -> sample count
+        
+        # We need ~5 seconds of audio to get a reliable chunk for Groq & Wespeaker
+        self._buffer_samples = 5 * SAMPLE_RATE
+        # Keep 1 second overlap so words at chunk boundaries aren't lost
+        self._overlap_samples = 1 * SAMPLE_RATE
+
+        # Speaker tracking
+        self._speaker_profiles: dict[str, np.ndarray] = {}
+        self._speaker_counts: dict[str, int] = {}
         self._next_num = 1
         self._session_start = time.time()
 
     # ------------------------------------------------------------------ #
-    #  Lazy model loading                                                  #
+    #  Model lazy-loading                                                  #
     # ------------------------------------------------------------------ #
 
-    def _load_whisper(self) -> None:
-        if self._whisper is not None:
-            return
-        from faster_whisper import WhisperModel
-
-        logger.info(
-            "Loading faster-whisper model '%s' (live path)",
-            settings.live_whisper_model,
-        )
-        self._whisper = WhisperModel(
-            settings.live_whisper_model,
-            device="cpu",        # CTranslate2 does not support MPS yet
-            compute_type="int8", # fastest on CPU, negligible accuracy loss
-        )
-
     def _load_encoder(self) -> None:
+        """Pyannote Wespeaker for robust 256-d voice embeddings."""
         if self._voice_encoder is not None:
             return
         import torch
@@ -220,24 +208,24 @@ class LiveTranscriptionSession:
             logger.warning("Speaker embedding failed: %s - labelling as Speaker 1", exc)
             return "Speaker 1"
 
+    def _get_groq_client(self) -> Any:
+        if getattr(self, "_groq_client", None) is None:
+            if not settings.groq_api_key:
+                raise RuntimeError("GROQ_API_KEY is not set in your .env file.")
+            from groq import Groq
+            self._groq_client = Groq(api_key=settings.groq_api_key)
+        return self._groq_client
+
     # ------------------------------------------------------------------ #
     #  Main entry point                                                    #
     # ------------------------------------------------------------------ #
 
     def process_chunk(self, raw_bytes: bytes) -> list[LiveChunk]:
-        """
-        Accept raw int16 LE PCM bytes (16 kHz, mono) from the browser WebSocket.
-
-        Returns a list of LiveChunks — one per detected speech segment within
-        the buffered window. Each segment gets its own speaker identification,
-        so two speakers within the same 5-second buffer are correctly labelled.
-        Returns an empty list while still buffering or during pure silence.
-
-        The browser sends Int16Array buffers (from ScriptProcessorNode) that are
-        already at 16 kHz because the AudioContext is created at that rate.
-        """
-        self._load_whisper()
+        import io
+        import soundfile as sf
+        
         self._load_encoder()
+        client = self._get_groq_client()
 
         # 1. Decode bytes -> float32
         int16 = np.frombuffer(raw_bytes, dtype=np.int16)
@@ -253,60 +241,53 @@ class LiveTranscriptionSession:
         # Keep last 1s so a sentence spanning a chunk boundary is not cut
         self._buffer = self._buffer[self._buffer_samples - self._overlap_samples :]
 
-        # 4. Transcribe with hallucination suppression
-        #
-        # Key parameters to suppress bad output:
-        #   - condition_on_previous_text=False: Stops Whisper from copying its own
-        #     previous output into the next chunk (the main cause of word repetitions).
-        #   - repetition_penalty=1.2: Makes Whisper penalise repeating the same word
-        #     within one chunk (kills "participate participate", "academic academic").
-        #   - no_repeat_ngram_size=3: Hard-bans any 3-gram from appearing twice.
-        #   - log_prob_threshold=-1.0: Reject chunks where average token probability
-        #     is too low (i.e. Whisper is guessing, not confident -> likely hallucination).
-        #   - compression_ratio_threshold=2.4: Reject output that has too many repeated
-        #     tokens (another hallucination signal).
-        #   - language="en": Lock to English. Without this, Whisper auto-detects per
-        #     chunk and wrongly assigns Korean or Dutch to background noise.
+        # 4. Transcribe with Groq API
         try:
-            # Determine language: use settings if set, otherwise default to "en" for live
-            # (auto-detect on 5s chunks is unreliable and causes foreign-language hallucinations)
             live_language = settings.language if settings.language else "en"
-
-            segments, _info = self._whisper.transcribe(
-                window,
-                language=live_language,
-                vad_filter=True,              # skip silent windows automatically
-                vad_parameters={
-                    "min_silence_duration_ms": 500,
-                    "threshold": 0.45,
-                },
-                # --- Hallucination suppression ---
-                condition_on_previous_text=False,
-                repetition_penalty=1.3,       # increased from 1.2
-                log_prob_threshold=-1.0,
-                compression_ratio_threshold=2.4,
-                beam_size=5,
+            
+            # Write 5s audio chunk to memory
+            buffer = io.BytesIO()
+            sf.write(buffer, window, SAMPLE_RATE, format="WAV")
+            buffer.seek(0)
+            
+            # Call Groq API
+            api_params = {
+                "model": settings.groq_stt_model,
+                "response_format": "verbose_json",
+                # Low temperature reduces hallucinations in live chunks
+                "temperature": 0.0,
+                "prompt": "The audio will ONLY contain English, Telugu, or Hindi (or a mix of them). Transcribe exactly what is spoken in the native script. Do not translate."
+            }
+            if getattr(settings, "language", None):
+                api_params["language"] = settings.language
+            
+            transcription = client.audio.transcriptions.create(
+                file=("live_chunk.wav", buffer.read()),
+                **api_params
             )
-            segments = list(segments)
+            
+            # Extract segments
+            segments = list(getattr(transcription, "segments", None) or [])
         except Exception as exc:
-            logger.error("faster-whisper error: %s", exc)
+            logger.error("Groq API error during live stream: %s", exc)
             return []
 
-        # Build one LiveChunk per VAD segment, each with its own speaker ID.
-        # This is the key improvement over assigning one speaker for the whole window:
-        # if Speaker A says something then Speaker B responds within the same 5s buffer,
-        # each sentence now gets identified independently.
+        # Build one LiveChunk per segment, each with its own speaker ID.
         chunks: list[LiveChunk] = []
         elapsed_base = time.time() - self._session_start
 
         for seg in segments:
-            seg_text = self._deduplicate(seg.text.strip())
+            # Groq segments are dicts
+            start_sec = float(seg.get("start", 0.0))
+            end_sec = float(seg.get("end", 0.0))
+            seg_text = self._deduplicate(seg.get("text", "").strip())
+
             if not seg_text or len(seg_text) < 3:
                 continue
 
             # Extract the audio slice for this specific VAD segment
-            start_sample = int(seg.start * SAMPLE_RATE)
-            end_sample   = int(seg.end   * SAMPLE_RATE)
+            start_sample = int(start_sec * SAMPLE_RATE)
+            end_sample   = int(end_sec * SAMPLE_RATE)
             seg_audio = window[start_sample : min(end_sample, len(window))]
 
             # resemblyzer needs at least ~1s of audio for a reliable embedding.
@@ -317,7 +298,7 @@ class LiveTranscriptionSession:
 
             speaker = self._identify_speaker(seg_audio)
 
-            seg_elapsed = elapsed_base + seg.start
+            seg_elapsed = elapsed_base + start_sec
             mins, secs = divmod(int(seg_elapsed), 60)
 
             chunks.append(LiveChunk(

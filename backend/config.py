@@ -43,9 +43,13 @@ class Settings(BaseSettings):
 
     # --- Hugging Face / Pyannote ---
     # Required to download the gated pyannote speaker-diarization and
-    # segmentation models. You must accept both model licenses on
     # huggingface.co before this token will work (see README setup steps).
     hf_token: str = ""
+
+    # --- Groq API ---
+    groq_api_key: str = ""
+    groq_stt_model: str = "whisper-large-v3"
+    groq_llm_model: str = "llama-3.3-70b-versatile"
 
     # --- WhisperX / Whisper ---
     whisper_model: str = "large-v3"

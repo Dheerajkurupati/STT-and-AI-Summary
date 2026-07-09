@@ -93,58 +93,53 @@ def _split_into_chunks(lines: list[str], max_words: int) -> list[str]:
 
 
 class SummarizerService:
-    """Stateful wrapper around the Ollama client, reused across requests."""
+    """Stateful wrapper around the Groq client, reused across requests."""
 
     def __init__(self) -> None:
         self._client: Any = None
 
     def _get_client(self) -> Any:
         if self._client is None:
-            import ollama
+            if not settings.groq_api_key:
+                raise SummarizationError("GROQ_API_KEY is not set.")
+            from groq import Groq
 
-            self._client = ollama.Client(
-                host=settings.ollama_host,
-                timeout=settings.ollama_request_timeout,
-            )
+            self._client = Groq(api_key=settings.groq_api_key)
         return self._client
 
-    def _call_ollama_json(self, prompt: str) -> dict:
+    def _call_groq_json(self, prompt: str) -> dict:
         """
-        Send one prompt to Ollama and parse the response as JSON.
+        Send one prompt to Groq (Llama-3.3-70B) and parse the response as JSON.
+        """
+        logger.info("Generating summary using Groq API (%s)...", settings.groq_llm_model)
 
-        format="json" constrains the model's output to valid JSON syntax
-        (an Ollama server-side feature), but it does NOT guarantee the keys
-        match our schema — the model could still return {} or unexpected
-        fields. Callers are responsible for defaulting missing keys.
-        """
         client = self._get_client()
         try:
-            response = client.chat(
-                model=settings.ollama_model,
+            response = client.chat.completions.create(
+                model=settings.groq_llm_model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                format="json",
+                response_format={"type": "json_object"},
             )
         except Exception as exc:
             raise SummarizationError(
-                f"Failed to reach Ollama at {settings.ollama_host} "
-                f"(is `ollama serve` running and is '{settings.ollama_model}' pulled?): {exc}"
+                f"Failed to reach Groq API: {exc}"
             ) from exc
 
-        content = response["message"]["content"]
+        content = response.choices[0].message.content
         try:
             return json.loads(content)
         except json.JSONDecodeError as exc:
             raise SummarizationError(
-                f"Ollama returned non-JSON content despite format='json': {content[:200]}"
+                f"Groq returned non-JSON content despite JSON mode: {content[:200]}"
             ) from exc
 
     def _summarize_chunk(self, chunk_text: str, index: int, total: int) -> dict:
         logger.info("Summarizing chunk %d/%d", index, total)
         prompt = build_chunk_summary_prompt(chunk_text, index, total)
-        return self._call_ollama_json(prompt)
+        return self._call_groq_json(prompt)
 
     def summarize(self, transcript: MeetingTranscript) -> SummaryResult:
         """
@@ -169,7 +164,7 @@ class SummarizerService:
             combined = json.dumps(chunk_summaries, indent=2)
             final_prompt = build_final_summary_prompt(combined, from_chunk_summaries=True)
 
-        raw = self._call_ollama_json(final_prompt)
+        raw = self._call_groq_json(final_prompt)
 
         return SummaryResult(
             executive_summary=raw.get("executive_summary", ""),
