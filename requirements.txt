@@ -38,4 +38,18 @@ setuptools<70.0.0
 # --- LLM (Ollama) ---
 ollama>=0.3.0
 
+# --- Optional benchmark engines (version2) ---
+# FunASR serves four alternative pipeline stages through one unified AutoModel API:
+# FSMN-VAD (backend/engines/vad.py), SenseVoice-Small (backend/engines/stt.py),
+# CAM++ speaker embeddings (backend/engines/diarization.py), and CT-Transformer
+# punctuation restoration (backend/engines/punctuation.py). All are opt-in via .env
+# (see ENGINE_* settings in config.py) — installing this does not change default
+# pipeline behavior. Verified installing cleanly on macOS arm64, CPU-only, no CUDA.
+funasr>=1.3.14
+modelscope>=1.38.1
+# AgglomerativeClustering, used by CamPlusPlusDiarizer to turn CAM++ embeddings
+# into speaker clusters (CAM++ itself is an embedding extractor, not an
+# end-to-end diarization pipeline like pyannote).
+scikit-learn>=1.9.0
+
 # --- Logging is stdlib `logging`; no extra dependency needed ---

@@ -4,8 +4,13 @@ Local, production-oriented meeting transcription pipeline: audio in,
 speaker-diarized Google Meet-style transcript + AI summary out.
 
 Pipeline: FFmpeg preprocessing -> WhisperX (Whisper large-v3 + alignment +
-pyannote diarization) -> transcript formatting -> Ollama (llama3.1:8b /
-qwen3:8b) summarization.
+pyannote diarization) -> transcript formatting -> Ollama (qwen3:8b, was
+llama3.1:8b) summarization.
+
+**version2 adds optional benchmark engines** for VAD, STT, and diarization —
+every stage still defaults to the models above; nothing changes unless you
+opt in via `.env`. See [Optional: benchmark engines](#optional-benchmark-engines-version2)
+below.
 
 ## 🚀 Quick Start Guide (From Zip File)
 
@@ -85,9 +90,12 @@ While logged into Hugging Face, visit and accept the license on **both** of thes
    *(Leave this running in its own terminal window, or let the Ollama menu-bar app manage it on macOS)*
 3. **Pull the AI Model** (in a new terminal window, make sure to navigate to the project directory):
    ```bash
-   ollama pull llama3.1:8b
+   ollama pull qwen3:8b
    ```
-   *(You can also use `qwen3:8b`. Set whichever you choose as `OLLAMA_MODEL` in `.env`.)*
+   *(This is the default as of version2, per client feedback that it produces
+   better structured JSON summaries than llama3.1:8b. You can still
+   `ollama pull llama3.1:8b` and set `OLLAMA_MODEL=llama3.1:8b` in `.env` to
+   compare.)*
 
 ### 7. Run the Application
 Ensure your virtual environment is activated (e.g. `source .venv/bin/activate` or `.venv\Scripts\activate`), then start the FastAPI server:
@@ -114,9 +122,15 @@ Once the process finishes, the pipeline will generate several files in the `outp
 
 ```
 backend/
-  config.py      settings (paths, model names, device, HF/Ollama config)
+  config.py      settings (paths, model names, device, HF/Ollama, engine selection)
   utils.py       logging setup, ffmpeg audio conversion, validation
-  transcribe.py  WhisperX: transcription + alignment + diarization
+  transcribe.py  upload pipeline orchestration (VAD -> STT -> align -> diarize)
+  stream.py      live (WebSocket) transcription: faster-whisper + speaker tracking
+  engines/       pluggable VAD/STT/diarization/punctuation models (version2)
+    vad.py         NoVad (default) | FsmnVad (FunASR FSMN-VAD)
+    stt.py          WhisperSttEngine (default) | SenseVoiceSttEngine (FunASR)
+    diarization.py  PyannoteDiarizer (default) | CamPlusPlusDiarizer (FunASR)
+    punctuation.py  NoOpPunctuator (default) | CtTransformerPunctuator (FunASR)
   formatter.py   raw segments -> Google Meet-style transcript
   prompts.py     Ollama prompt templates
   summarize.py   Ollama: chunked summarization -> structured summary
@@ -126,6 +140,41 @@ outputs/         transcript.json, transcript.txt, summary.json, summary.txt
 temp/            intermediate WAV files (safe to purge)
 logs/            pipeline.log
 ```
+
+## Optional: benchmark engines (version2)
+
+Client feedback flagged speaker-label accuracy as the main pain point, so
+version2 adds swappable alternatives for a few pipeline stages — both the
+original model and the new one stay in the codebase so you can compare them
+on the same file, rather than one silently replacing the other. **Every
+default below reproduces the exact pre-version2 pipeline** — nothing changes
+until you set one of these in `.env`.
+
+Install the extra dependencies (already in `requirements.txt`):
+```bash
+pip install -r requirements.txt   # now includes funasr, modelscope, scikit-learn
+```
+All FunASR models run CPU-only (`device="cpu"`, no CUDA) and download
+automatically from ModelScope on first use, same lazy-load-and-cache pattern
+as WhisperX/pyannote.
+
+| `.env` setting | Default | Alternative | What it does |
+|---|---|---|---|
+| `VAD_ENGINE` | `none` | `fsmn` | Trims silence via FunASR FSMN-VAD before STT runs (upload only) |
+| `STT_ENGINE` | `whisperx` | `sensevoice` | Swaps Whisper large-v3 for FunASR SenseVoice-Small |
+| `DIARIZATION_ENGINE` | `pyannote` | `campplusplus` | Swaps pyannote for a CAM++ embeddings + clustering diarizer (best-effort, see `backend/engines/diarization.py`) |
+| `LIVE_VAD_ENGINE` | `silero` | `fsmn` | Live path only: pre-filters silence with FSMN-VAD before calling faster-whisper |
+| `ENABLE_PUNCTUATION_RESTORATION` | `false` | `true` | Re-punctuates STT output with FunASR CT-Transformer before alignment |
+
+**Comparing two engines on the same file** (writes distinct output files
+instead of overwriting each other):
+```bash
+python cli.py uploads/meeting_3_speakers.wav --diarization pyannote
+python cli.py uploads/meeting_3_speakers.wav --diarization campplusplus
+# -> outputs/meeting_3_speakers.{stt}.{diarization}.{vad}.transcript.{json,txt}
+```
+`--vad`, `--stt`, and `--diarization` on `cli.py` override the corresponding
+`.env` setting for a single run only.
 
 ## Notes
 

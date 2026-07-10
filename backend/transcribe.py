@@ -1,22 +1,38 @@
 """
-WhisperX integration: transcription + word alignment + speaker diarization.
+Upload pipeline orchestration: VAD -> STT -> punctuation -> word alignment ->
+diarization -> speaker assignment -> post-processing.
 
-WHY THIS FILE OWNS ALL OF WHISPERX/PYANNOTE:
-This is the only module that imports whisperx (and, transitively,
-pyannote.audio). Every other module talks to this one through the plain
-TranscriptionResult/RawSegment data shapes, never through WhisperX's own
-types. That means:
-- If WhisperX changes its API (it has, across versions), only this file
-  needs to change.
-- If we ever swap the engine entirely (e.g. a hosted transcription API),
-  only this file changes — formatter.py, summarize.py, and app.py are
-  unaffected because they only depend on RawSegment/TranscriptionResult.
+WHY THIS FILE ORCHESTRATES RATHER THAN HARDCODES ONE ENGINE (version2):
+Client feedback on speaker-label accuracy led to adding benchmark
+alternatives for VAD/STT/diarization (see backend/engines/) alongside the
+original WhisperX/pyannote pipeline. This file no longer owns those model
+calls directly — each stage's actual model logic lives in its own
+backend/engines/*.py module (same isolation principle as before, just one
+level more granular), and WhisperXPipeline.transcribe() wires the selected
+engines (backend.config.settings.vad_engine / stt_engine /
+diarization_engine) together. The two stages the client's table marked
+"keep" — WhisperX's wav2vec2 word alignment and whisperx.assign_word_speakers
+— are NOT pluggable and still called directly here verbatim, because they
+were verified (against the installed whisperx source) to work generically
+with any engine's output: alignment only needs segment start/end/text, and
+assign_word_speakers only needs a DataFrame with start/end/speaker columns.
 
-WHY MODELS ARE LOADED LAZILY AND CACHED ON THE INSTANCE:
-Whisper large-v3 and the diarization pipeline are multi-GB models that take
-real time to load from disk. In a FastAPI server handling multiple
-requests, we load them once (at first use) and reuse the same instance for
-every subsequent request, rather than reloading per-request.
+WHY TranscriptionResult / RawSegment DON'T CHANGE:
+Every other module (formatter.py, app.py, cli.py) talks to this file only
+through TranscriptionResult/RawSegment. Regardless of which VAD/STT/
+diarization engine is selected, transcribe() still returns the exact same
+shape — downstream code needs zero changes to support new engines.
+
+WHY MODELS/ENGINES ARE LOADED LAZILY AND CACHED ON THE INSTANCE:
+Whisper large-v3, the diarization pipeline, and every FunASR model are
+large and take real time to load from disk. In a FastAPI server handling
+multiple requests, we load them once (at first use) and reuse the same
+instance for every subsequent request, rather than reloading per-request.
+Which engine gets constructed is decided once, from settings, on first
+access — settings are loaded once at process startup, so this is
+equivalent to a per-process engine choice (this is also why cli.py's
+per-run --stt/--vad/--diarization overrides must be set before the first
+call to pipeline.transcribe() in that process).
 """
 
 from __future__ import annotations
@@ -47,42 +63,60 @@ class TranscriptionResult:
 
 class WhisperXPipeline:
     """
-    Thin, stateful wrapper around WhisperX's three stages: transcribe,
-    align, diarize. One instance is created and reused for the lifetime of
-    the process (see app.py's startup hook).
+    Orchestrates the upload pipeline over pluggable engines (see
+    backend/engines/): VAD -> STT -> [punctuation] -> align -> diarize ->
+    assign speakers -> post-process. One instance is created and reused for
+    the lifetime of the process (see app.py's startup hook); each engine is
+    constructed lazily on first use and cached, same as before.
     """
 
     def __init__(self) -> None:
-        self._whisper_model: Any = None
         self._align_model: Any = None
         self._align_metadata: Any = None
         self._align_language: str | None = None
-        self._diarize_pipeline: Any = None
+        self._vad_engine: Any = None
+        self._stt_engine: Any = None
+        self._diarization_engine: Any = None
+        self._punctuator: Any = None
 
-    def _load_whisper_model(self) -> Any:
-        if self._whisper_model is None:
-            # Imported lazily, not at module load time, so importing
-            # backend.transcribe (e.g. for type checking or from app.py's
-            # module graph) doesn't force torch/whisperx to load immediately.
-            import whisperx
+    def _get_vad_engine(self) -> Any:
+        if self._vad_engine is None:
+            from backend.engines.vad import get_vad_engine
 
-            logger.info(
-                "Loading Whisper model '%s' on device=%s compute_type=%s",
-                settings.whisper_model,
-                settings.device,
-                settings.compute_type,
-            )
-            self._whisper_model = whisperx.load_model(
-                settings.whisper_model,
-                device=settings.device,
-                compute_type=settings.compute_type,
-            )
-        return self._whisper_model
+            logger.info("Selected VAD engine: %s", settings.vad_engine)
+            self._vad_engine = get_vad_engine(settings.vad_engine)
+        return self._vad_engine
+
+    def _get_stt_engine(self) -> Any:
+        if self._stt_engine is None:
+            from backend.engines.stt import get_stt_engine
+
+            logger.info("Selected STT engine: %s", settings.stt_engine)
+            self._stt_engine = get_stt_engine(settings.stt_engine)
+        return self._stt_engine
+
+    def _get_diarization_engine(self) -> Any:
+        if self._diarization_engine is None:
+            from backend.engines.diarization import get_diarization_engine
+
+            logger.info("Selected diarization engine: %s", settings.diarization_engine)
+            self._diarization_engine = get_diarization_engine(settings.diarization_engine)
+        return self._diarization_engine
+
+    def _get_punctuator(self) -> Any:
+        if self._punctuator is None:
+            from backend.engines.punctuation import get_punctuator
+
+            self._punctuator = get_punctuator(settings.enable_punctuation_restoration)
+        return self._punctuator
 
     def _load_align_model(self, language_code: str) -> tuple[Any, Any]:
         # Alignment models are language-specific, so we reload only if the
         # detected language changes between requests (rare, but possible
         # with multilingual meetings processed back to back).
+        # NOT pluggable: verified against the installed whisperx source that
+        # align() only needs segment start/end/text, so it works identically
+        # regardless of which STT engine produced those segments.
         if self._align_model is None or self._align_language != language_code:
             import whisperx
 
@@ -93,29 +127,11 @@ class WhisperXPipeline:
             self._align_language = language_code
         return self._align_model, self._align_metadata
 
-    def _load_diarize_pipeline(self) -> Any:
-        if self._diarize_pipeline is None:
-            if not settings.hf_token:
-                raise TranscriptionError(
-                    "HF_TOKEN is not set. Diarization requires a Hugging Face "
-                    "token with access to pyannote/speaker-diarization-3.1 "
-                    "(see README setup steps)."
-                )
-
-            import whisperx
-
-            logger.info("Loading pyannote diarization pipeline")
-            self._diarize_pipeline = whisperx.diarize.DiarizationPipeline(
-                model_name=settings.diarization_model,
-                token=settings.hf_token,
-                device=settings.device,
-            )
-        return self._diarize_pipeline
-
     def transcribe(self, audio_path: Path) -> TranscriptionResult:
         """
-        Run the full WhisperX pipeline on a preprocessed (mono, 16kHz WAV)
-        audio file: transcribe -> align -> diarize -> assign speakers.
+        Run the full upload pipeline on a preprocessed (mono, 16kHz WAV)
+        audio file: VAD -> STT -> [punctuation] -> align -> diarize -> assign
+        speakers -> post-process.
         """
         import whisperx
 
@@ -124,23 +140,29 @@ class WhisperXPipeline:
         except Exception as exc:  # whisperx/ffmpeg-backed loader raises broadly
             raise TranscriptionError(f"Failed to load audio {audio_path}: {exc}") from exc
 
+        from whisperx.audio import SAMPLE_RATE as sample_rate  # 16000; matches utils.py's ffmpeg output
+
         try:
-            whisper_model = self._load_whisper_model()
-            transcription = whisper_model.transcribe(
-                audio,
-                batch_size=settings.batch_size,
-                language=settings.language,
+            vad_spans = self._get_vad_engine().detect(audio, sample_rate)
+
+            raw_segments, detected_language = self._get_stt_engine().transcribe(
+                audio, sample_rate, vad_spans, settings.language
             )
-            detected_language = transcription["language"]
             # Whisper large-v3 sometimes returns variants like 'en_US'
             # but the alignment model expects strict 2-letter ISO codes.
             if len(detected_language) > 2:
                 detected_language = detected_language[:2].lower()
             logger.info("Detected language (normalized): %s", detected_language)
 
+            if settings.enable_punctuation_restoration:
+                raw_segments = self._get_punctuator().restore(raw_segments)
+
+            if not raw_segments:
+                return TranscriptionResult(segments=[], language=detected_language, duration_seconds=0.0)
+
             align_model, align_metadata = self._load_align_model(detected_language)
             aligned = whisperx.align(
-                transcription["segments"],
+                raw_segments,
                 align_model,
                 align_metadata,
                 audio,
@@ -148,17 +170,12 @@ class WhisperXPipeline:
                 return_char_alignments=False,
             )
 
-            diarize_pipeline = self._load_diarize_pipeline()
-            diarization = diarize_pipeline(
-                audio,
-                min_speakers=settings.min_speakers,
-                max_speakers=settings.max_speakers,
-            )
-            result = whisperx.assign_word_speakers(diarization, aligned)
+            diarize_df = self._get_diarization_engine().diarize(audio, sample_rate)
+            result = whisperx.assign_word_speakers(diarize_df, aligned)
         except TranscriptionError:
             raise
         except Exception as exc:
-            raise TranscriptionError(f"WhisperX pipeline failed on {audio_path}: {exc}") from exc
+            raise TranscriptionError(f"Pipeline failed on {audio_path}: {exc}") from exc
 
         segments = self._to_raw_segments(result["segments"])
         duration = max((s.end for s in segments), default=0.0)

@@ -99,8 +99,37 @@ class Settings(BaseSettings):
     # --- Ollama ---
     # Using 127.0.0.1 instead of localhost to prevent IPv6 httpx timeouts on Macs
     ollama_host: str = "http://127.0.0.1:11434"
-    ollama_model: str = "llama3.1:8b"
+    # Switched from llama3.1:8b to qwen3:8b (client feedback: better structured
+    # JSON extraction). llama3.1:8b stays installed and fully supported —
+    # override OLLAMA_MODEL in .env to go back to it, nothing else changes.
+    ollama_model: str = "qwen3:8b"
     ollama_request_timeout: int = 300
+
+    # --- Pipeline engine selection (version2) ---
+    # Each of these picks between the current default model and a benchmark
+    # alternative for one pipeline stage. Every engine module lives under
+    # backend/engines/ and is documented there — this section only wires the
+    # choice through. Defaults reproduce today's exact behavior; nothing about
+    # the running pipeline changes unless one of these is explicitly set.
+    #
+    # Upload VAD: "none" (whole file goes to STT, today's behavior) | "fsmn"
+    # (FunASR FSMN-VAD trims silence before STT, may reduce hallucinations).
+    vad_engine: str = "none"
+    # Upload STT: "whisperx" (Whisper large-v3, today's default) | "sensevoice"
+    # (FunASR SenseVoice-Small, benchmark for multilingual/conversational speech).
+    stt_engine: str = "whisperx"
+    # Upload diarization: "pyannote" (today's default) | "campplusplus"
+    # (FunASR CAM++ embeddings + clustering — a hand-assembled diarizer, not a
+    # mature end-to-end pipeline like pyannote; see backend/engines/diarization.py).
+    diarization_engine: str = "pyannote"
+    # Live VAD: "silero" (Silero VAD bundled inside faster-whisper's
+    # vad_filter=True, today's default) | "fsmn" (FunASR FSMN-VAD run manually
+    # per buffered window before faster-whisper is even called).
+    live_vad_engine: str = "silero"
+    # Punctuation restoration: off by default so the Whisper/SenseVoice baseline
+    # is unaffected unless explicitly enabled for comparison. When on, FunASR's
+    # CT-Transformer punctuation model re-punctuates STT output before alignment.
+    enable_punctuation_restoration: bool = False
 
     # --- Summarization chunking ---
     # Rough word-count budget per chunk sent to the LLM. Kept conservative

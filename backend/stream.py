@@ -29,6 +29,14 @@ KEY IMPROVEMENTS OVER V1:
 - log_prob_threshold + compression_ratio_threshold filter out low-confidence garbage.
 - condition_on_previous_text=False prevents Whisper from copying its own previous output.
 - Minimum text length guard (< 3 chars) to skip single-character phantom outputs.
+
+LIVE VAD BENCHMARK OPTION (version2):
+LIVE_VAD_ENGINE=silero (default) is unchanged — faster-whisper's own
+vad_filter=True handles silence internally, exactly as before this setting
+existed. LIVE_VAD_ENGINE=fsmn adds a pre-filter: FunASR's FSMN-VAD (see
+backend/engines/vad.py) checks the buffered window for speech BEFORE calling
+faster-whisper at all, skipping the call entirely on silence. This is a
+benchmark option for comparing VAD quality/latency, not a default change.
 """
 
 from __future__ import annotations
@@ -73,6 +81,7 @@ class LiveTranscriptionSession:
     def __init__(self) -> None:
         self._whisper = None          # faster_whisper.WhisperModel, loaded lazily
         self._voice_encoder = None    # resemblyzer.VoiceEncoder, loaded lazily
+        self._fsmn_vad = None         # backend.engines.vad.FsmnVad, loaded lazily (LIVE_VAD_ENGINE=fsmn only)
         self._buffer = np.zeros(0, dtype=np.float32)
         # Sliding Window Config
         self._emit_interval_samples = int(SAMPLE_RATE * settings.live_buffer_seconds)
@@ -104,6 +113,14 @@ class LiveTranscriptionSession:
             device="cpu",        # CTranslate2 does not support MPS yet
             compute_type="int8", # fastest on CPU, negligible accuracy loss
         )
+
+    def _load_fsmn_vad(self):
+        if self._fsmn_vad is None:
+            from backend.engines.vad import FsmnVad
+
+            logger.info("Loading FSMN-VAD for live pre-filtering (LIVE_VAD_ENGINE=fsmn)")
+            self._fsmn_vad = FsmnVad()
+        return self._fsmn_vad
 
     def _load_encoder(self) -> None:
         if self._voice_encoder is not None:
@@ -262,6 +279,17 @@ class LiveTranscriptionSession:
         total_audio_seconds = len(self._buffer) / SAMPLE_RATE
         window_duration = len(window) / SAMPLE_RATE
         window_start_time = total_audio_seconds - window_duration
+
+        # Benchmark pre-filter: when LIVE_VAD_ENGINE=fsmn, skip the faster-whisper
+        # call entirely if FSMN-VAD finds no speech in this window. Default
+        # ("silero") skips this and relies on faster-whisper's own vad_filter=True
+        # below, exactly like before this option existed.
+        if settings.live_vad_engine == "fsmn":
+            try:
+                if not self._load_fsmn_vad().has_speech(window, SAMPLE_RATE):
+                    return []
+            except Exception as exc:
+                logger.warning("FSMN-VAD pre-filter failed, falling back to faster-whisper: %s", exc)
 
         try:
             live_language = settings.language if settings.language else "en"

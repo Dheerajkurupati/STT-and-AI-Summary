@@ -116,6 +116,15 @@ class SummarizerService:
         (an Ollama server-side feature), but it does NOT guarantee the keys
         match our schema — the model could still return {} or unexpected
         fields. Callers are responsible for defaulting missing keys.
+
+        WHY think=False: qwen3:8b (the version2 default) is a hybrid-reasoning
+        model that by default prepends a chain-of-thought "thinking" trace
+        before its actual answer. That's wasted latency for a fixed-schema
+        JSON extraction task — confirmed during version2 testing that leaving
+        thinking on caused real summarization calls to exceed the 300s
+        request timeout on this CPU-only machine. think=False is a no-op for
+        models without reasoning support (e.g. llama3.1:8b), so this is safe
+        regardless of which OLLAMA_MODEL is configured.
         """
         client = self._get_client()
         try:
@@ -126,6 +135,7 @@ class SummarizerService:
                     {"role": "user", "content": prompt},
                 ],
                 format="json",
+                think=False,
             )
         except Exception as exc:
             raise SummarizationError(
