@@ -170,28 +170,140 @@ class WhisperXPipeline:
         )
 
     @staticmethod
-    def _to_raw_segments(whisperx_segments: list[dict]) -> list[RawSegment]:
+    def _force_sentence_speakers(words: list[dict]) -> None:
         """
-        Convert WhisperX's raw segment dicts into our typed RawSegment
-        contract. A segment can be missing a "speaker" key if diarization
-        couldn't confidently assign one (e.g. cross-talk) — we label those
-        "SPEAKER_UNKNOWN" rather than dropping the text, so no speech is
-        silently lost from the transcript.
+        Groups words into sentences using punctuation (.!?), counts the speaker
+        frequencies within each sentence, and mathematically forces the ENTIRE
+        sentence to belong to the majority speaker. This perfectly eliminates
+        mid-sentence boundary bleeds caused by Pyannote without using an LLM.
         """
-        segments: list[RawSegment] = []
-        for seg in whisperx_segments:
-            text = (seg.get("text") or "").strip()
+        if not words:
+            return
+
+        sentence_start_idx = 0
+        for i, word_obj in enumerate(words):
+            text = word_obj.get("word", "").strip()
             if not text:
                 continue
-            segments.append(
-                RawSegment(
-                    start=float(seg["start"]),
-                    end=float(seg["end"]),
-                    text=text,
-                    speaker=seg.get("speaker", "SPEAKER_UNKNOWN"),
-                )
-            )
-        return segments
+                
+            # If this word ends with sentence-ending punctuation, or it's the very last word
+            if text[-1] in ".!?" or i == len(words) - 1:
+                # We found a full sentence from sentence_start_idx to i
+                sentence_words = words[sentence_start_idx:i + 1]
+                
+                # Count speakers
+                speaker_counts = {}
+                for w in sentence_words:
+                    spk = w.get("speaker")
+                    if spk:
+                        speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+                
+                # Find majority speaker
+                if speaker_counts:
+                    majority_speaker = max(speaker_counts.items(), key=lambda x: x[1])[0]
+                    # Force all words in this sentence to the majority speaker
+                    for w in sentence_words:
+                        w["speaker"] = majority_speaker
+                
+                sentence_start_idx = i + 1
+
+    @classmethod
+    def _to_raw_segments(cls, whisperx_segments: list[dict]) -> list[RawSegment]:
+        segments: list[RawSegment] = []
+        for seg in whisperx_segments:
+            if "words" not in seg or not seg["words"]:
+                text = (seg.get("text") or "").strip()
+                if text:
+                    segments.append(RawSegment(
+                        start=float(seg.get("start", 0.0)),
+                        end=float(seg.get("end", 0.0)),
+                        text=text,
+                        speaker=seg.get("speaker", "SPEAKER_UNKNOWN"),
+                    ))
+                continue
+
+            # Apply sentence-level majority voting to fix Pyannote mid-sentence bleeds
+            cls._force_sentence_speakers(seg["words"])
+
+            current_speaker: str | None = None
+            current_words: list[str] = []
+            current_start = 0.0
+
+            for word_obj in seg["words"]:
+                word_speaker = word_obj.get("speaker", seg.get("speaker", "SPEAKER_UNKNOWN"))
+                word_text = word_obj.get("word", "").strip()
+                if not word_text:
+                    continue
+
+                if current_speaker is None:
+                    current_speaker = word_speaker
+                    current_start = word_obj.get("start", 0.0)
+
+                # Split on speaker change
+                if word_speaker != current_speaker and current_words:
+                    segments.append(RawSegment(
+                        start=float(current_start),
+                        end=float(word_obj.get("start", 0.0)),
+                        text=" ".join(current_words),
+                        speaker=current_speaker,
+                    ))
+                    current_words = []
+                    current_speaker = word_speaker
+                    current_start = word_obj.get("start", 0.0)
+
+                current_words.append(word_text)
+
+            if current_words:
+                last_word = seg["words"][-1]
+                segments.append(RawSegment(
+                    start=float(current_start),
+                    end=float(last_word.get("end", 0.0)),
+                    text=" ".join(current_words),
+                    speaker=current_speaker or "SPEAKER_UNKNOWN",
+                ))
+
+        # Perform semantic boundary snapping to fix minor word bleeds
+        return cls._semantic_boundary_snap(segments)
+
+    @classmethod
+    def _semantic_boundary_snap(cls, segments: list[RawSegment]) -> list[RawSegment]:
+        """
+        Fixes punctuation drift. 
+        If a sentence ends with punctuation, but the next speaker's block starts 
+        with a lowercase continuation word, we mathematically pull that word back.
+        """
+        if not segments:
+            return segments
+
+        for i in range(len(segments) - 1):
+            curr = segments[i]
+            nxt = segments[i + 1]
+
+            if curr.speaker == nxt.speaker:
+                continue
+
+            curr_words = curr.text.split()
+            nxt_words = nxt.text.split()
+
+            if not curr_words or not nxt_words:
+                continue
+
+            # Bleed type 1: Pyannote pushed the LAST word of Speaker A into Speaker B
+            if nxt_words[0][-1] in ".!?" and len(nxt_words) > 1 and nxt_words[1][0].isupper():
+                bleeding_word = nxt_words.pop(0)
+                curr_words.append(bleeding_word)
+                curr.text = " ".join(curr_words)
+                nxt.text = " ".join(nxt_words)
+
+            # Bleed type 2: Pyannote pushed the FIRST word of Speaker B into Speaker A
+            elif curr_words[-1][-1] not in ".!?" and curr_words[-1].islower() and len(curr_words) > 1 and curr_words[-2][-1] in ".!?":
+                bleeding_word = curr_words.pop()
+                nxt_words.insert(0, bleeding_word)
+                curr.text = " ".join(curr_words)
+                nxt.text = " ".join(nxt_words)
+
+        # Remove any segments that became empty after snapping
+        return [s for s in segments if s.text.strip()]
 
 
 # Single shared instance, analogous to `settings` in config.py — app.py

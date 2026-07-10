@@ -74,17 +74,17 @@ class LiveTranscriptionSession:
         self._whisper = None          # faster_whisper.WhisperModel, loaded lazily
         self._voice_encoder = None    # resemblyzer.VoiceEncoder, loaded lazily
         self._buffer = np.zeros(0, dtype=np.float32)
-        # 5s buffer gives resemblyzer more voice data for stable embeddings,
-        # which drastically reduces "same person detected as new speaker" false positives.
-        self._buffer_samples = int(SAMPLE_RATE * settings.live_buffer_seconds)
-        # NO overlap: overlap was causing the same words to appear twice at
-        # chunk boundaries (e.g. "incorporate that. of how you incorporate that.").
-        # faster-whisper's built-in VAD handles boundary words correctly on its own.
-        self._overlap_samples = 0
+        # Sliding Window Config
+        self._emit_interval_samples = int(SAMPLE_RATE * settings.live_buffer_seconds)
+        self._max_window_samples = int(SAMPLE_RATE * 15.0)
+        self._unprocessed_samples = 0
+        self._last_emitted_end_time = 0.0
+
         self._speaker_profiles: dict[str, np.ndarray] = {}   # label -> avg embedding
         self._speaker_counts: dict[str, int] = {}             # label -> sample count
         self._next_num = 1
         self._session_start = time.time()
+        self._last_transcript = ""
 
     # ------------------------------------------------------------------ #
     #  Lazy model loading                                                  #
@@ -198,7 +198,11 @@ class LiveTranscriptionSession:
                     best_dist = dist
                     best_label = label
 
-            if best_label and best_dist <= settings.live_wespeaker_threshold:
+            # Force a minimum leniency of 0.75 to prevent 9-speaker fragmentation
+            # during live cross-talk, while respecting user config if they set it even higher.
+            threshold = max(settings.live_wespeaker_threshold, 0.75)
+            
+            if best_label and best_dist <= threshold:
                 # Known speaker - update running average so the profile adapts
                 n = self._speaker_counts[best_label]
                 self._speaker_profiles[best_label] = (
@@ -243,89 +247,119 @@ class LiveTranscriptionSession:
         int16 = np.frombuffer(raw_bytes, dtype=np.int16)
         float32 = int16.astype(np.float32) / 32768.0
         self._buffer = np.concatenate([self._buffer, float32])
+        self._unprocessed_samples += len(float32)
 
-        # 2. Wait until buffer is full
-        if len(self._buffer) < self._buffer_samples:
+        # 2. Wait until we have enough new audio (e.g. 5s)
+        if self._unprocessed_samples < self._emit_interval_samples:
             return []
+            
+        self._unprocessed_samples = 0
 
-        # 3. Extract window, keep overlap
-        window = self._buffer[: self._buffer_samples].copy()
-        # Keep last 1s so a sentence spanning a chunk boundary is not cut
-        self._buffer = self._buffer[self._buffer_samples - self._overlap_samples :]
+        # 3. Extract up to 15 seconds of history for deep context
+        window = self._buffer[-self._max_window_samples :]
+        
+        # Calculate exactly where this 15s window starts in the overall stream
+        total_audio_seconds = len(self._buffer) / SAMPLE_RATE
+        window_duration = len(window) / SAMPLE_RATE
+        window_start_time = total_audio_seconds - window_duration
 
-        # 4. Transcribe with hallucination suppression
-        #
-        # Key parameters to suppress bad output:
-        #   - condition_on_previous_text=False: Stops Whisper from copying its own
-        #     previous output into the next chunk (the main cause of word repetitions).
-        #   - repetition_penalty=1.2: Makes Whisper penalise repeating the same word
-        #     within one chunk (kills "participate participate", "academic academic").
-        #   - no_repeat_ngram_size=3: Hard-bans any 3-gram from appearing twice.
-        #   - log_prob_threshold=-1.0: Reject chunks where average token probability
-        #     is too low (i.e. Whisper is guessing, not confident -> likely hallucination).
-        #   - compression_ratio_threshold=2.4: Reject output that has too many repeated
-        #     tokens (another hallucination signal).
-        #   - language="en": Lock to English. Without this, Whisper auto-detects per
-        #     chunk and wrongly assigns Korean or Dutch to background noise.
         try:
-            # Determine language: use settings if set, otherwise default to "en" for live
-            # (auto-detect on 5s chunks is unreliable and causes foreign-language hallucinations)
             live_language = settings.language if settings.language else "en"
 
             segments, _info = self._whisper.transcribe(
                 window,
                 language=live_language,
-                vad_filter=True,              # skip silent windows automatically
+                vad_filter=True,
                 vad_parameters={
-                    "min_silence_duration_ms": 500,
+                    # Relax VAD from 500ms to 2000ms. If a user takes a breath, we DO NOT 
+                    # want to slice the sentence in half, otherwise large-v3 hallucinates!
+                    "min_silence_duration_ms": 2000,
                     "threshold": 0.45,
                 },
-                # --- Hallucination suppression ---
+                # We turn off condition_on_previous_text because the 15s window
+                # already contains massive context natively! This prevents hallucination loops.
                 condition_on_previous_text=False,
-                repetition_penalty=1.3,       # increased from 1.2
+                repetition_penalty=1.3,
+                
+                # --- Anti-Hallucination Enforcements ---
+                # Force temperature to 0 to stop Whisper from "guessing" words
+                temperature=0.0,
+                # Reduce beam size to stop it from creatively building fake sentences
+                beam_size=2,
+                
                 log_prob_threshold=-1.0,
                 compression_ratio_threshold=2.4,
-                beam_size=5,
+                word_timestamps=True,  # Crucial for sub-segment Diarization
             )
             segments = list(segments)
         except Exception as exc:
             logger.error("faster-whisper error: %s", exc)
             return []
 
-        # Build one LiveChunk per VAD segment, each with its own speaker ID.
-        # This is the key improvement over assigning one speaker for the whole window:
-        # if Speaker A says something then Speaker B responds within the same 5s buffer,
-        # each sentence now gets identified independently.
         chunks: list[LiveChunk] = []
-        elapsed_base = time.time() - self._session_start
 
         for seg in segments:
-            seg_text = self._deduplicate(seg.text.strip())
-            if not seg_text or len(seg_text) < 3:
+            if not seg.words:
                 continue
 
-            # Extract the audio slice for this specific VAD segment
-            start_sample = int(seg.start * SAMPLE_RATE)
-            end_sample   = int(seg.end   * SAMPLE_RATE)
-            seg_audio = window[start_sample : min(end_sample, len(window))]
+            # Group words into sentences by punctuation (.!?)
+            sentence_words = []
+            for i, w in enumerate(seg.words):
+                sentence_words.append(w)
+                text = w.word.strip()
+                
+                # If this word ends with a sentence terminator, or it's the last word in the segment
+                if (text and text[-1] in ".!?") or i == len(seg.words) - 1:
+                    if not sentence_words:
+                        continue
+                        
+                    sentence_start = sentence_words[0].start
+                    sentence_end = sentence_words[-1].end
+                    sentence_text = "".join(w.word for w in sentence_words).strip()
+                    
+                    sentence_absolute_start = window_start_time + sentence_start
+                    sentence_absolute_end = window_start_time + sentence_end
+                    
+                    # Deduplication: Only emit if this sentence started AFTER our last emitted sentence ENDED.
+                    if sentence_absolute_start <= self._last_emitted_end_time - 0.3:
+                        sentence_words = []
+                        continue
+                        
+                    sentence_text = self._deduplicate(sentence_text)
+                    if not sentence_text or len(sentence_text) < 3:
+                        sentence_words = []
+                        continue
 
-            # resemblyzer needs at least ~1s of audio for a reliable embedding.
-            # If this VAD segment is shorter, fall back to the full window
-            # (still better than no identification).
-            if len(seg_audio) < SAMPLE_RATE:
-                seg_audio = window
+                    # Extract audio strictly for this sentence for perfectly targeted Diarization
+                    start_sample = int(sentence_start * SAMPLE_RATE)
+                    end_sample   = int(sentence_end   * SAMPLE_RATE)
+                    seg_audio = window[start_sample : min(end_sample, len(window))]
 
-            speaker = self._identify_speaker(seg_audio)
+                    # --- Diarization Padding ---
+                    # If the sentence is too short, expand bounds symmetrically to 1.5s
+                    min_samples = int(1.5 * SAMPLE_RATE)
+                    if len(seg_audio) < min_samples:
+                        pad_needed = min_samples - len(seg_audio)
+                        pad_left = pad_needed // 2
+                        pad_right = pad_needed - pad_left
+                        
+                        s_idx = max(0, start_sample - pad_left)
+                        e_idx = min(len(window), end_sample + pad_right)
+                        seg_audio = window[s_idx:e_idx]
 
-            seg_elapsed = elapsed_base + seg.start
-            mins, secs = divmod(int(seg_elapsed), 60)
+                    speaker = self._identify_speaker(seg_audio)
+                    
+                    mins, secs = divmod(int(sentence_absolute_start), 60)
 
-            chunks.append(LiveChunk(
-                speaker=speaker,
-                text=seg_text,
-                timestamp=f"{mins:02d}:{secs:02d}",
-                start_seconds=seg_elapsed,
-            ))
+                    chunks.append(LiveChunk(
+                        speaker=speaker,
+                        text=sentence_text,
+                        timestamp=f"{mins:02d}:{secs:02d}",
+                        start_seconds=sentence_absolute_start,
+                    ))
+                    
+                    self._last_emitted_end_time = sentence_absolute_end
+                    sentence_words = []
 
         return chunks
 
