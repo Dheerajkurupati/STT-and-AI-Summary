@@ -89,6 +89,7 @@ async function submitToBackend(formData) {
 let liveWs = null;
 let audioContext = null;
 let mediaStream = null;
+let mediaStreamSource = null;
 let scriptProcessor = null;
 let recordingInterval = null;
 let recordingSeconds = 0;
@@ -100,14 +101,39 @@ const timerDisplay = document.getElementById('recordingTimer');
 
 startBtn.addEventListener('click', async () => {
     try {
-        // 1. Get microphone access
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-        // 2. Create AudioContext at 16kHz — Whisper's native sample rate.
-        //    This avoids resampling on the backend and reduces bandwidth.
+        // 1. Create AudioContext synchronously BEFORE any 'await'.
+        //    Browsers will suspend the context if created after yielding to an async call.
         audioContext = new AudioContext({ sampleRate: 16000 });
 
-        // 3. Open WebSocket FIRST, stream audio only once connected.
+        // 2. Get microphone access
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // 3. Ensure context is running (sometimes still needed on Safari/Chrome)
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+
+        // 4. Create audio graph IMMEDIATELY to prevent GC or suspension
+        mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
+        scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        scriptProcessor.onaudioprocess = (e) => {
+            if (!liveWs || liveWs.readyState !== WebSocket.OPEN) return;
+
+            // Float32 [-1..1] -> Int16 [-32768..32767]
+            const float32 = e.inputBuffer.getChannelData(0);
+            const int16 = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+                int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+            }
+            liveWs.send(int16.buffer);
+        };
+
+        mediaStreamSource.connect(scriptProcessor);
+        // Connect to destination (silent node) to keep the graph alive
+        scriptProcessor.connect(audioContext.destination);
+
+        // 5. Open WebSocket FIRST, stream audio only once connected.
         const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const wsUrl = `${wsProtocol}://${window.location.host}/ws/live`;
         liveWs = new WebSocket(wsUrl);
@@ -115,27 +141,6 @@ startBtn.addEventListener('click', async () => {
 
         liveWs.onopen = () => {
             console.log('[WS] Connected to /ws/live');
-
-            // ScriptProcessorNode fires every 4096 samples (~0.26 s at 16kHz).
-            // We send each callback's PCM data straight to the WebSocket.
-            const source = audioContext.createMediaStreamSource(mediaStream);
-            scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-
-            scriptProcessor.onaudioprocess = (e) => {
-                if (!liveWs || liveWs.readyState !== WebSocket.OPEN) return;
-
-                // Float32 [-1..1] -> Int16 [-32768..32767]
-                const float32 = e.inputBuffer.getChannelData(0);
-                const int16 = new Int16Array(float32.length);
-                for (let i = 0; i < float32.length; i++) {
-                    int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
-                }
-                liveWs.send(int16.buffer);
-            };
-
-            source.connect(scriptProcessor);
-            // Connect to destination (silent node) to keep the graph alive
-            scriptProcessor.connect(audioContext.destination);
         };
 
         liveWs.onmessage = (e) => {

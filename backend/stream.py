@@ -85,6 +85,7 @@ class LiveTranscriptionSession:
         self._next_num = 1
         self._session_start = time.time()
         self._last_transcript = ""
+        self._last_speaker: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     #  Lazy model loading                                                  #
@@ -163,7 +164,7 @@ class LiveTranscriptionSession:
     #  Speaker identification                                              #
     # ------------------------------------------------------------------ #
 
-    def _identify_speaker(self, audio: np.ndarray) -> str:
+    def _identify_speaker(self, audio: np.ndarray, force_existing: bool = False) -> Optional[str]:
         """
         Return a consistent "Speaker N" label for the audio window.
 
@@ -198,9 +199,14 @@ class LiveTranscriptionSession:
                     best_dist = dist
                     best_label = label
 
-            # Force a minimum leniency of 0.75 to prevent 9-speaker fragmentation
+            # Force a minimum leniency of 0.85 to prevent 9-speaker fragmentation
             # during live cross-talk, while respecting user config if they set it even higher.
-            threshold = max(settings.live_wespeaker_threshold, 0.75)
+            threshold = max(settings.live_wespeaker_threshold, 0.85)
+            
+            if force_existing and best_label:
+                # If force_existing is true, we map to the closest existing speaker (even if noisy).
+                # But we don't update the running average with noisy short clips!
+                return best_label
             
             if best_label and best_dist <= threshold:
                 # Known speaker - update running average so the profile adapts
@@ -308,8 +314,19 @@ class LiveTranscriptionSession:
                 sentence_words.append(w)
                 text = w.word.strip()
                 
-                # If this word ends with a sentence terminator, or it's the last word in the segment
-                if (text and text[-1] in ".!?") or i == len(seg.words) - 1:
+                # Force a split if there's a noticeable pause after this word, 
+                # or if the chunk is getting too long (to prevent merging speakers during cross-talk)
+                force_split = False
+                if i < len(seg.words) - 1:
+                    next_word = seg.words[i + 1]
+                    # Extreme granular splitting: 0.3s pause or 2.5s duration
+                    if next_word.start - w.end > 0.3:
+                        force_split = True
+                    elif (w.end - sentence_words[0].start) > 2.5:
+                        force_split = True
+                
+                # If this word ends with a sentence terminator, or it's the last word in the segment, or forced
+                if (text and text[-1] in ".!?") or i == len(seg.words) - 1 or force_split:
                     if not sentence_words:
                         continue
                         
@@ -336,8 +353,9 @@ class LiveTranscriptionSession:
                     seg_audio = window[start_sample : min(end_sample, len(window))]
 
                     # --- Diarization Padding ---
-                    # If the sentence is too short, expand bounds symmetrically to 1.5s
-                    min_samples = int(1.5 * SAMPLE_RATE)
+                    # If the sentence is too short, expand bounds symmetrically to 0.8s.
+                    # We avoid padding too much (e.g. 1.5s) to prevent bleeding into another speaker's voice.
+                    min_samples = int(0.8 * SAMPLE_RATE)
                     if len(seg_audio) < min_samples:
                         pad_needed = min_samples - len(seg_audio)
                         pad_left = pad_needed // 2
@@ -347,7 +365,22 @@ class LiveTranscriptionSession:
                         e_idx = min(len(window), end_sample + pad_right)
                         seg_audio = window[s_idx:e_idx]
 
-                    speaker = self._identify_speaker(seg_audio)
+                    # --- Short Clip Smart Mapping ---
+                    # Pyannote struggles to spawn a NEW speaker from < 1.2s of audio.
+                    # But we can still ask it which EXISTING speaker it sounds like most.
+                    speaker = None
+                    if (sentence_end - sentence_start) < 1.2 and self._last_speaker:
+                        # Try to find the closest existing speaker, ignoring the strict 0.85 new-speaker threshold
+                        closest_speaker = self._identify_speaker(seg_audio, force_existing=True)
+                        if closest_speaker:
+                            speaker = closest_speaker
+                        else:
+                            speaker = self._last_speaker
+                    else:
+                        speaker = self._identify_speaker(seg_audio)
+                        
+                    if speaker:
+                        self._last_speaker = speaker
                     
                     mins, secs = divmod(int(sentence_absolute_start), 60)
 
@@ -372,6 +405,7 @@ class LiveTranscriptionSession:
         self._buffer = np.zeros(0, dtype=np.float32)
         self._speaker_profiles.clear()
         self._speaker_counts.clear()
+        self._last_speaker = None
         logger.info(
             "Live session ended - %d speaker(s) tracked over %.0fs",
             self._next_num - 1,
